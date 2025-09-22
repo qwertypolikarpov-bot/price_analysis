@@ -18,12 +18,23 @@ from io import BytesIO
 from typing import List, Optional, Tuple, Dict
 from decimal import Decimal, ROUND_HALF_UP
 
-import openpyxl
-from openpyxl.utils import get_column_letter
-from openpyxl.styles import PatternFill
-from openpyxl.formatting.rule import ColorScaleRule, FormulaRule, CellIsRule
-import pandas as pd
-import streamlit as st
+try:
+    import openpyxl
+    from openpyxl.utils import get_column_letter
+    from openpyxl.styles import PatternFill
+    from openpyxl.formatting.rule import ColorScaleRule, FormulaRule, CellIsRule
+except ImportError as e:
+    print(f"Ошибка импорта openpyxl: {e}")
+    print("Установите openpyxl: pip install openpyxl")
+    raise
+
+try:
+    import pandas as pd
+    import streamlit as st
+except ImportError as e:
+    print(f"Ошибка импорта pandas/streamlit: {e}")
+    print("Установите зависимости: pip install pandas streamlit")
+    raise
 
 
 # ========= Общие параметры =========
@@ -459,7 +470,22 @@ def flag_at(data: List[List], row_idx: int, price_col_idx0: int, flag_base: int)
 
 # ========= Остатки =========
 # Разрешаем 12,0 и 12.0, но всё равно фильтруем только числа/дефисы
-STOCK_PATTERN = re.compile(r"^\s*([0-9]+(?:[.,]\d+)?|[-])(\s*/\s*([0-9]+(?:[.,]\d+)?|[-]))+\s*$")
+# Разрешаем ТОЛЬКО целые или *.0 (12, 12.0, 12,0) и дефисы.
+# Это отсечёт рыночные цены с дробной частью (18,32/22,47 и т.п.)
+_SEG = r"(?:[0-9]+(?:[.,]0+)?)|-"
+STOCK_PATTERN = re.compile(rf"^\s*({_SEG})(\s*/\s*({_SEG}))+?\s*$")
+
+ALLOWED_VIRTUAL = {0, 35, 50}
+def _virtual_ok(v: Optional[int]) -> bool:
+    return v in ALLOWED_VIRTUAL
+
+INTERNAL_PRICE_HEADER_TOKENS = {"cost","кост","себестоимость",
+                                "cash","кэш","нал","наличный","наличные",
+                                "f17","ф17","vip","вип","ндс","prime","fox"}
+
+def _is_internal_header(text: str) -> bool:
+    s = norm(text)
+    return any(tok in s for tok in INTERNAL_PRICE_HEADER_TOKENS)
 
 # НОВОЕ: формат «1 771 шт» / «1771 pcs»
 PLAIN_STOCK_PATTERN = re.compile(r"^\s*([0-9][0-9\s.,]*)\s*(?:шт|pcs)\b", re.IGNORECASE)
@@ -1123,6 +1149,9 @@ def analyze_cash_df(df: pd.DataFrame) -> pd.DataFrame:
         scan_top = min(len(data), first_row + 300)
         best_j, best_cnt = -1, -1
         for j in range(0, y_base):
+            header_text = _gather_headers_pairwise(data, first_row, j)
+            if _is_internal_header(header_text):
+                continue  # не считаем такие столбцы кандидатами для остатков
             cnt = 0
             for r in range(first_row, scan_top):
                 v = data[r][j] if len(data[r]) > j else None
@@ -1149,15 +1178,44 @@ def analyze_cash_df(df: pd.DataFrame) -> pd.DataFrame:
         name = extract_name_row(data, pr, 4)
         brand = guess_brand(name)
 
-        # ----- Остатки (robust) -----
+        # ----- Остатки (с приоритетом stock_col) -----
         stock_val = virtual_stock_val = None
         stock_raw = None
 
-        total, virt, raw = read_stock_robust(data, pr, y_base, stock_col)
-        if total is not None:
-            stock_val = total
-            virtual_stock_val = virt
-            stock_raw = raw
+        # 3.1. Пытаемся прочитать ТОЛЬКО из stock_col (pr, pr+1, pr+2)
+        if stock_col is not None and stock_col >= 0:
+            for r_off in (0, 1, 2):
+                rr = pr + r_off
+                if rr >= len(data): break
+                val = data[rr][stock_col] if len(data[rr]) > stock_col else None
+                if isinstance(val, str) and STOCK_PATTERN.match(val):
+                    vvirt = parse_virtual_stock_value(val)
+                    if _virtual_ok(vvirt):
+                        stock_raw = val
+                        stock_val = parse_stock_value(val)
+                        virtual_stock_val = vvirt
+                        break
+
+        # 3.2. Если не нашли — ДОПУСКАЕМ широкий поиск, но только с проверкой виртуала
+        if stock_val is None:
+            best = None  # (segments, rr, jj, raw)
+            for r_off in (0, 1, 2):
+                rr = pr + r_off
+                if rr >= len(data): break
+                for jj in range(0, y_base):
+                    val = data[rr][jj] if len(data[rr]) > jj else None
+                    if isinstance(val, str) and STOCK_PATTERN.match(val):
+                        vvirt = parse_virtual_stock_value(val)
+                        if not _virtual_ok(vvirt):
+                            continue
+                        cand = (val.count("/"), rr, jj, val)
+                        if best is None or cand[0] > best[0]:
+                            best = cand
+            if best is not None:
+                _, rr, jj, raw = best
+                stock_raw = raw
+                stock_val = parse_stock_value(raw)
+                virtual_stock_val = parse_virtual_stock_value(raw)
 
         # === COST/Cash_old ===  (VIP-правило Cost)
         # Колонку Cost берём как в VIP
@@ -1393,6 +1451,9 @@ def analyze_f17_df(df: pd.DataFrame) -> pd.DataFrame:
         scan_top = min(len(data), first_row + 300)
         best_j, best_cnt = -1, -1
         for j in range(0, y_base):
+            header_text = _gather_headers_pairwise(data, first_row, j)
+            if _is_internal_header(header_text):
+                continue  # не считаем такие столбцы кандидатами для остатков
             cnt = 0
             for r in range(first_row, scan_top):
                 v = data[r][j] if len(data[r]) > j else None
@@ -1427,6 +1488,12 @@ def analyze_f17_df(df: pd.DataFrame) -> pd.DataFrame:
             stock_val = total
             virtual_stock_val = virt
             stock_raw = raw
+
+        if stock_raw is not None and not _virtual_ok(virtual_stock_val):
+            # это была не колонка остатков → игнорируем
+            stock_raw = None
+            stock_val = None
+            virtual_stock_val = None
 
         # COST/Cash/F17_old
         # VIP-логика выбора колонки Cost
@@ -1721,6 +1788,9 @@ def analyze_zakup_df(df: pd.DataFrame) -> pd.DataFrame:
         scan_top = min(len(data), first_row + 300)
         best_j, best_cnt = -1, -1
         for j in range(0, y_base):
+            header_text = _gather_headers_pairwise(data, first_row, j)
+            if _is_internal_header(header_text):
+                continue  # не считаем такие столбцы кандидатами для остатков
             cnt = 0
             for r in range(first_row, scan_top):
                 v = data[r][j] if len(data[r]) > j else None
@@ -1756,6 +1826,12 @@ def analyze_zakup_df(df: pd.DataFrame) -> pd.DataFrame:
             stock_val = total
             virtual_stock_val = virt
             stock_raw = raw
+
+        if stock_raw is not None and not _virtual_ok(virtual_stock_val):
+            # это была не колонка остатков → игнорируем
+            stock_raw = None
+            stock_val = None
+            virtual_stock_val = None
 
         # колонки cost / zakup_old
         # VIP-логика выбора колонки Cost
@@ -2126,6 +2202,9 @@ def analyze_vip_df(df: pd.DataFrame, VIP_FALLBACK_COL=_VIP_FALLBACK_COL_FROZEN) 
         scan_top = min(len(data), first_row + 300)
         best_j, best_cnt = -1, -1
         for j in range(0, y_base):
+            header_text = _gather_headers_pairwise(data, first_row, j)
+            if _is_internal_header(header_text):
+                continue  # не считаем такие столбцы кандидатами для остатков
             cnt = 0
             for r in range(first_row, scan_top):
                 v = data[r][j] if len(data[r]) > j else None
@@ -2162,6 +2241,12 @@ def analyze_vip_df(df: pd.DataFrame, VIP_FALLBACK_COL=_VIP_FALLBACK_COL_FROZEN) 
             stock_val = total
             virtual_stock_val = virt
             stock_raw = raw
+
+        if stock_raw is not None and not _virtual_ok(virtual_stock_val):
+            # это была не колонка остатков → игнорируем
+            stock_raw = None
+            stock_val = None
+            virtual_stock_val = None
 
         # COST: только если ячейка жёлтая; позже можем снять при Stock=0
         raw_cost = parse_float(data[pr + 1][cost_col]) if pr + 1 < len(data) and cost_col != -1 else None
@@ -2951,10 +3036,10 @@ def export_all_analyses_to_excel(cash_df: pd.DataFrame, f17_df: pd.DataFrame,
     return output
 
 # ========= UI =========
-st.title("Объединенный анализ цен: Cash, F17, Zakup, VIP")
+st.title("Загрузить анализ рынка для актуальзации цен: Cash, F17, Zakup, VIP")
 
 st.write(
-    "**Объединенный анализ всех цен** - Cash, F17, Zakup, VIP в одном Excel файле"
+    "**Анализ рынка для актуализации цен** - Cash, F17, Zakup, VIP в одном Excel файле"
 )
 st.write("- Загрузите основной .xlsx с рынком (жёлтые флаги)")
 st.write("- Результат: Excel файл с 4 листами (Cash, F17, Zakup, VIP)")
