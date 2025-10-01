@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Объединенный анализ цен: Cash, F17, Zakup, VIP
 
@@ -14,15 +13,15 @@
 import math
 import re
 import zipfile
+from decimal import ROUND_HALF_UP, Decimal
 from io import BytesIO
-from typing import List, Optional, Tuple, Dict
-from decimal import Decimal, ROUND_HALF_UP
+from typing import List, Optional, Tuple
 
 try:
     import openpyxl
-    from openpyxl.utils import get_column_letter
+    from openpyxl.formatting.rule import CellIsRule, ColorScaleRule, FormulaRule
     from openpyxl.styles import PatternFill
-    from openpyxl.formatting.rule import ColorScaleRule, FormulaRule, CellIsRule
+    from openpyxl.utils import get_column_letter
 except ImportError as e:
     print(f"Ошибка импорта openpyxl: {e}")
     print("Установите openpyxl: pip install openpyxl")
@@ -39,96 +38,131 @@ except ImportError as e:
 
 # ========= Общие параметры =========
 STEP = 0.1
-MIN_SUPPLIERS = 2                 # минимум валидных цен рынка
-LIFT_GAP = 0.5                    # (не используется для таргета p2, но оставлено для совместимости)
-DOS_HIGH = 45                     # DoS > 45 → цель #1 (только для отчётных метрик)
-DOS_MID  = 20                     # 20 ≤ DoS ≤ 45 → цель #2 (метрика)
+MIN_SUPPLIERS = 2  # минимум валидных цен рынка
+LIFT_GAP = 0.5  # (не используется для таргета p2, но оставлено для совместимости)
+DOS_HIGH = 45  # DoS > 45 → цель #1 (только для отчётных метрик)
+DOS_MID = 20  # 20 ≤ DoS ≤ 45 → цель #2 (метрика)
 
-GAP_THRESHOLD = 0.40              # анти-выбросы: разрыв ≥40% → отбрасываем край
-MARKET_ABOVE_OLD_CAP_PCT = 0.15   # потолок к Zakup_old: +15%
+GAP_THRESHOLD = 0.40  # анти-выбросы: разрыв ≥40% → отбрасываем край
+MARKET_ABOVE_OLD_CAP_PCT = 0.15  # потолок к Zakup_old: +15%
 
 # Cash параметры
-CASH_MIN_MARGIN_PCT = 0.015       # общий нижний порог: Cash ≥ Cost×1.015
-FIRST_PLACE_MARGIN_PCT = 0.12     # (исторический параметр; не задействован в P2-target)
+CASH_MIN_MARGIN_PCT = 0.015  # общий нижний порог: Cash ≥ Cost×1.015
+FIRST_PLACE_MARGIN_PCT = 0.12  # (исторический параметр; не задействован в P2-target)
 
 # F17 параметры
-MIN_ABS_MARGIN = 0.50     # абсолютная минимальная наценка к Cost
-PRICE_TICK   = 0.01
+MIN_ABS_MARGIN = 0.50  # абсолютная минимальная наценка к Cost
+PRICE_TICK = 0.01
 
-UNDERCUT_MIN = PRICE_TICK # минимум, на сколько ниже p1 должны быть (0.01)
-FALLBACK_COST_COL_1B = None # дефолтная колонка Cost (1-based), если не нашли по заголовку
-FALLBACK_ZAKUP_COL_1B = 25 # дефолтная колонка Zakup (1-based), если не нашли по заголовку
-FALLBACK_VIP_COL_1B = 36 # дефолтная колонка VIP (1-based), если не нашли по заголовку
+UNDERCUT_MIN = PRICE_TICK  # минимум, на сколько ниже p1 должны быть (0.01)
+FALLBACK_COST_COL_1B = (
+    None  # дефолтная колонка Cost (1-based), если не нашли по заголовку
+)
+FALLBACK_ZAKUP_COL_1B = (
+    25  # дефолтная колонка Zakup (1-based), если не нашли по заголовку
+)
+FALLBACK_VIP_COL_1B = 36  # дефолтная колонка VIP (1-based), если не нашли по заголовку
 
 # --- F17 alignment with base version ---
-ROUND_TO_HALF = True            # floor к шагу 0.50
-ROUND_ENDING_99 = True          # .99 только когда итог ровно целое
-GRANDFATHER_MIN_MARGIN = 0.00   # разрешаем держать старую, даже если < Cost+0.50
+ROUND_TO_HALF = True  # floor к шагу 0.50
+ROUND_ENDING_99 = True  # .99 только когда итог ровно целое
+GRANDFATHER_MIN_MARGIN = 0.00  # разрешаем держать старую, даже если < Cost+0.50
 GAP_TIGHTEN_ENABLED = True
-GAP_TIGHTEN_TRIGGER = 1.00      # если gap с p1 ≥ 1.00 → подтяжка (разрешаем upmove)
-SKIP_OLD_WHEN_MARKET_INFEASIBLE = True  # рынок есть, но infeasible → не откатываемся на старую
+GAP_TIGHTEN_TRIGGER = 1.00  # если gap с p1 ≥ 1.00 → подтяжка (разрешаем upmove)
+SKIP_OLD_WHEN_MARKET_INFEASIBLE = (
+    True  # рынок есть, но infeasible → не откатываемся на старую
+)
 
 # ========= Общие утилиты =========
-TRUE_TOK = {"true","да","y","1","ж","желтая","yellow"}
-FALSE_TOK = {"false","нет","n","0","","неж","not yellow","notyellow"}
+TRUE_TOK = {"true", "да", "y", "1", "ж", "желтая", "yellow"}
+FALSE_TOK = {"false", "нет", "n", "0", "", "неж", "not yellow", "notyellow"}
+
 
 def norm(s: str) -> str:
     s = str(s)
-    s = s.lower().replace("ё","е")
-    s = re.sub(r"[·–—-−]+","-", s)
-    s = s.replace("…","...")
-    s = re.sub(r"\s+"," ", s)
+    s = s.lower().replace("ё", "е")
+    s = re.sub(r"[·–—-−]+", "-", s)
+    s = s.replace("…", "...")
+    s = re.sub(r"\s+", " ", s)
     return s.strip()
 
+
 def is_true_like(v) -> bool:
-    if isinstance(v,bool): return v
-    if v is None: return False
-    if isinstance(v,(int,float)) and pd.notna(v):
-        try: return float(v)==1.0
-        except: return False
-    if isinstance(v,str):
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    if isinstance(v, (int, float)) and pd.notna(v):
+        try:
+            return float(v) == 1.0
+        except:
+            return False
+    if isinstance(v, str):
         s = norm(v)
-        if s in TRUE_TOK: return True
-        if s in FALSE_TOK: return False
-        if s.startswith("ж") and "желт" in s: return True
+        if s in TRUE_TOK:
+            return True
+        if s in FALSE_TOK:
+            return False
+        if s.startswith("ж") and "желт" in s:
+            return True
     return False
 
+
 def parse_float(x) -> Optional[float]:
-    if x is None: return None
-    if isinstance(x,(int,float)):
-        try: return float(x)
-        except: return None
-    s = re.sub(r"\s+","", str(x).strip()).replace(",", ".")
-    if s in {"-","—","–",""}: return None
-    try: return float(s)
-    except: return None
+    if x is None:
+        return None
+    if isinstance(x, (int, float)):
+        try:
+            return float(x)
+        except:
+            return None
+    s = re.sub(r"\s+", "", str(x).strip()).replace(",", ".")
+    if s in {"-", "—", "–", ""}:
+        return None
+    try:
+        return float(s)
+    except:
+        return None
+
 
 def parse_price(x) -> Optional[float]:
-    if x is None: return None
-    if isinstance(x,str):
+    if x is None:
+        return None
+    if isinstance(x, str):
         s = x.split("/")[0]
-        s = re.sub(r"\s+","", s).replace(",", ".")
-        if s in {"-","—","–",""}: return None
-        try: return float(s)
-        except: return None
-    if isinstance(x,(int,float)):
-        try: return float(x)
-        except: return None
+        s = re.sub(r"\s+", "", s).replace(",", ".")
+        if s in {"-", "—", "–", ""}:
+            return None
+        try:
+            return float(s)
+        except:
+            return None
+    if isinstance(x, (int, float)):
+        try:
+            return float(x)
+        except:
+            return None
     return None
 
+
 def floor1(x: Optional[float]) -> Optional[float]:
-    return math.floor(x*10)/10.0 if x is not None else None
+    return math.floor(x * 10) / 10.0 if x is not None else None
+
 
 def ceil1(x: Optional[float]) -> Optional[float]:
     return math.ceil(x * 10) / 10.0 if x is not None else None
 
+
 def round_half_down_0_01(x: Optional[float]) -> Optional[float]:
-    if x is None: return None
+    if x is None:
+        return None
     d = Decimal(str(x)) - Decimal("0.0005")
     return float(d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
+
 # ========= F17 helpers (динамический undercut, округления, soft-cap) =========
 from decimal import ROUND_FLOOR
+
 
 def calc_undercut_step(p_ref: Optional[float]) -> float:
     """
@@ -140,13 +174,15 @@ def calc_undercut_step(p_ref: Optional[float]) -> float:
     s = f"{d:.2f}"
     return 0.49 if s.endswith("9") else 0.50
 
+
 def round_to_0_50(x: Optional[float]) -> Optional[float]:
-    if x is None: 
+    if x is None:
         return None
     d = Decimal(str(x))
     # floor к шагу 0.50
     y = (d * 2).to_integral_value(rounding=ROUND_FLOOR) / Decimal(2)
     return float(Decimal(y).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
 
 def apply_ending_99_if_integer(x: Optional[float]) -> Optional[float]:
     """Если после округления получилось целое — делаем .99"""
@@ -157,18 +193,23 @@ def apply_ending_99_if_integer(x: Optional[float]) -> Optional[float]:
         d = d - Decimal("0.01")
     return float(d)
 
-def target_by_market_softcap(p_ref: Optional[float], cost: Optional[float], f17_old: Optional[float]) -> Optional[float]:
+
+def target_by_market_softcap(
+    p_ref: Optional[float], cost: Optional[float], f17_old: Optional[float]
+) -> Optional[float]:
     if p_ref is None or cost is None:
         return None
 
-    step = calc_undercut_step(p_ref)     # обычно 0.50
+    step = calc_undercut_step(p_ref)  # обычно 0.50
     min_allowed = cost + 0.50
-    target_max_50 = p_ref - step         # хотим быть ≤ этого
+    target_max_50 = p_ref - step  # хотим быть ≤ этого
 
     # если с 0.50 в принципе невыполнимо — сразу пробуем 0.49
     if min_allowed > target_max_50 + 1e-9:
         cand49 = float(Decimal(str(p_ref)) - Decimal("0.49"))
-        cand49 = float(Decimal(str(cand49)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        cand49 = float(
+            Decimal(str(cand49)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        )
         if cand49 >= min_allowed - 1e-9:
             # cap только на повышения
             if f17_old is not None and cand49 > f17_old:
@@ -192,13 +233,17 @@ def target_by_market_softcap(p_ref: Optional[float], cost: Optional[float], f17_
     # если после floor к 0.50 провалились ниже минимума — пробуем «мягкий» андеркат 0.49 (даёт .99)
     if cand < min_allowed - 1e-9:
         cand49 = float(Decimal(str(p_ref)) - Decimal("0.49"))
-        cand49 = float(Decimal(str(cand49)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        cand49 = float(
+            Decimal(str(cand49)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        )
         if cand49 >= min_allowed - 1e-9:
             if f17_old is not None and cand49 > f17_old:
                 cand49 = min(cand49, f17_old, cost + 3.00)
             return cand49
         # крайний случай — отдать минимум (в центах), если 0.49 тоже не спасает
-        return float(Decimal(str(min_allowed)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+        return float(
+            Decimal(str(min_allowed)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        )
 
     # подстраховка: держим под p1-step (для 0.50-ветки)
     if cand > target_max_50 + 1e-9:
@@ -210,7 +255,9 @@ def target_by_market_softcap(p_ref: Optional[float], cost: Optional[float], f17_
         if cand < min_allowed - 1e-9:
             # fallback к 0.49, если после подрезки опять сломали минимум
             cand49 = float(Decimal(str(p_ref)) - Decimal("0.49"))
-            cand49 = float(Decimal(str(cand49)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+            cand49 = float(
+                Decimal(str(cand49)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            )
             if cand49 >= min_allowed - 1e-9:
                 if f17_old is not None and cand49 > f17_old:
                     cand49 = min(cand49, f17_old, cost + 3.00)
@@ -223,49 +270,80 @@ def target_by_market_softcap(p_ref: Optional[float], cost: Optional[float], f17_
 
     return float(Decimal(str(cand)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
+
 def is_intlike(val) -> bool:
-    if val is None: return False
-    if isinstance(val,int): return True
-    if isinstance(val,float): return float(val).is_integer()
+    if val is None:
+        return False
+    if isinstance(val, int):
+        return True
+    if isinstance(val, float):
+        return float(val).is_integer()
     s = str(val).strip()
-    if s.endswith(".0"): s = s[:-2]
+    if s.endswith(".0"):
+        s = s[:-2]
     return s.isdigit()
 
-def looks_like_name(s) -> bool:
-    if not isinstance(s,str): return False
-    if s.strip() in {"+","-","=",""}: return False
-    return bool(re.search(r"[A-Za-zА-Яа-я]", s)) and len(s.strip())>=3
 
-def extract_name_row(data: List[List], product_row: int, name_col: int=4) -> Optional[str]:
-    cand = data[product_row][name_col] if len(data[product_row])>name_col else None
-    if looks_like_name(cand): return str(cand).strip()
-    for j in range(name_col-2, name_col+3):
-        if j<0: continue
-        c = data[product_row][j] if len(data[product_row])>j else None
-        if looks_like_name(c): return str(c).strip()
+def looks_like_name(s) -> bool:
+    if not isinstance(s, str):
+        return False
+    if s.strip() in {"+", "-", "=", ""}:
+        return False
+    return bool(re.search(r"[A-Za-zА-Яа-я]", s)) and len(s.strip()) >= 3
+
+
+def extract_name_row(
+    data: List[List], product_row: int, name_col: int = 4
+) -> Optional[str]:
+    cand = data[product_row][name_col] if len(data[product_row]) > name_col else None
+    if looks_like_name(cand):
+        return str(cand).strip()
+    for j in range(name_col - 2, name_col + 3):
+        if j < 0:
+            continue
+        c = data[product_row][j] if len(data[product_row]) > j else None
+        if looks_like_name(c):
+            return str(c).strip()
     return None
 
+
 def guess_brand(name: Optional[str]) -> Optional[str]:
-    if not name: return None
+    if not name:
+        return None
     s = str(name)
-    s = re.sub(r"\b(edp|edt|edc|deo|man|men|woman|lady|tester)\b"," ", s, flags=re.IGNORECASE)
-    s = re.sub(r"\b\d+(\.\d+)?\s*ml\b"," ", s, flags=re.IGNORECASE)
-    s = re.sub(r"\s+"," ", s).strip()
+    s = re.sub(
+        r"\b(edp|edt|edc|deo|man|men|woman|lady|tester)\b", " ", s, flags=re.IGNORECASE
+    )
+    s = re.sub(r"\b\d+(\.\d+)?\s*ml\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s+", " ", s).strip()
     token = s.split(" ")[0]
     mapping = {
-        "pr.":"P.R.","p.r.":"P.R.","pr":"P.R.",
-        "armani":"Armani","emporio":"Armani",
-        "dkny":"DKNY","kenzo":"Kenzo","lanvin":"Lanvin",
-        "lacoste":"Lacoste","givenchy":"Givenchy","trussardi":"Trussardi",
-        "cacharel":"Cacharel","versace":"Versace","gucci":"Gucci",
-        "boss":"Hugo Boss","hugo":"Hugo Boss",
-        "banderas":"A.Banderas","a.banderas":"A.Banderas","a.banderas.":"A.Banderas",
+        "pr.": "P.R.",
+        "p.r.": "P.R.",
+        "pr": "P.R.",
+        "armani": "Armani",
+        "emporio": "Armani",
+        "dkny": "DKNY",
+        "kenzo": "Kenzo",
+        "lanvin": "Lanvin",
+        "lacoste": "Lacoste",
+        "givenchy": "Givenchy",
+        "trussardi": "Trussardi",
+        "cacharel": "Cacharel",
+        "versace": "Versace",
+        "gucci": "Gucci",
+        "boss": "Hugo Boss",
+        "hugo": "Hugo Boss",
+        "banderas": "A.Banderas",
+        "a.banderas": "A.Banderas",
+        "a.banderas.": "A.Banderas",
     }
     key = norm(token)
     return mapping.get(key, token)
 
+
 def load_workbook_safe(file, data_only=True):
-    data = file.read() if hasattr(file,"read") else open(file,"rb").read()
+    data = file.read() if hasattr(file, "read") else open(file, "rb").read()
     bio = BytesIO(data)
     if not zipfile.is_zipfile(bio):
         raise ValueError("Файл не .xlsx (zip) — возможно .xls или повреждён.")
@@ -274,27 +352,63 @@ def load_workbook_safe(file, data_only=True):
         return openpyxl.load_workbook(bio, data_only=data_only)
     except KeyError as e:
         if "xl/sharedStrings.xml" in str(e):
-            raise ValueError("Нет xl/sharedStrings.xml. Пересохраните как нормальный .xlsx.")
+            raise ValueError(
+                "Нет xl/sharedStrings.xml. Пересохраните как нормальный .xlsx."
+            )
         raise
+
 
 # ========= Рынок: матчинг поставщиков =========
 _MARKET_BASE = [
-    "шанталь спец","шанталь","shantal","Шанталь С...","шанталь с...",
-    "борики братья - гульден 14","борики братья — гульден 14","борики братья","гульден 14",
-    "владимир","владимир спец",
+    "шанталь спец",
+    "шанталь",
+    "shantal",
+    "Шанталь С...",
+    "шанталь с...",
+    "борики братья - гульден 14",
+    "борики братья — гульден 14",
+    "борики братья",
+    "гульден 14",
+    "владимир",
+    "владимир спец",
     "дима американец",
-    "лужники ирина (пав.1.6)","лужники ирина","пав.1.6",
-    "настя марина","настя мар","натс",
+    "лужники ирина (пав.1.6)",
+    "лужники ирина",
+    "пав.1.6",
+    "настя марина",
+    "настя мар",
+    "натс",
     "парк",
-    "Саша Черн...","тихом","тоня","сергей",
-    "альянс групп","альянс-групп","альянс груп","alyans grupp","alyans group","alliance group",
-    "белка","belka",
-    "андрей","andrey","andrei",
+    "Саша Черн...",
+    "тихом",
+    "тоня",
+    "сергей",
+    "альянс групп",
+    "альянс-групп",
+    "альянс груп",
+    "alyans grupp",
+    "alyans group",
+    "alliance group",
+    "белка",
+    "belka",
+    "андрей",
+    "andrey",
+    "andrei",
     "лужники и",
-    "авангард","avangard",
+    "авангард",
+    "avangard",
 ]
-_EXCL = ["владимир марк","vladimir mark","парк марк","park mark",
-         "шанталь марк","шанталь марка","шанталь м","shantal mark","shantal m"]
+_EXCL = [
+    "владимир марк",
+    "vladimir mark",
+    "парк марк",
+    "park mark",
+    "шанталь марк",
+    "шанталь марка",
+    "шанталь м",
+    "shantal mark",
+    "shantal m",
+]
 _EXCL_PAT = [
     r"^\s*владимир\s*\.\.\.\s*$",
     r"(?:^|[\s(\[{])владимир\s*\.{3}(?:$|[\s)\]}:,-])",
@@ -304,15 +418,18 @@ _EXCL_PAT = [
     r"(?:^|[\s(\[{])shantal\s*mark\w*(?:$|[\s)\]}:,-])",
 ]
 
-def _normalize_name_for_match(s: str)->str:
+
+def _normalize_name_for_match(s: str) -> str:
     ns = norm(s)
-    ns = re.sub(r"[^\w\s().:-]"," ", ns)
-    ns = re.sub(r"\s+"," ", ns).strip()
+    ns = re.sub(r"[^\w\s().:-]", " ", ns)
+    ns = re.sub(r"\s+", " ", ns).strip()
     return ns
 
-def _word_boundary_contains(haystack: str, needle: str)->bool:
-    pat = r"(?:^|[\s().:-])"+re.escape(needle)+r"(?:$|[\s().:-])"
+
+def _word_boundary_contains(haystack: str, needle: str) -> bool:
+    pat = r"(?:^|[\s().:-])" + re.escape(needle) + r"(?:$|[\s().:-])"
     return re.search(pat, haystack, flags=re.IGNORECASE) is not None
+
 
 # --- Константы для Parel ---
 PAREL_MARK_PATTERNS = [
@@ -321,11 +438,13 @@ PAREL_MARK_PATTERNS = [
     r"\bparel+\s*ma",
     r"\bparel+\s*mark",
     r"\bparell+\s*ma",
-    r"\bparell+\s*mark"
+    r"\bparell+\s*mark",
 ]
+
 
 def _is_parel_mark(ns: str) -> bool:
     return any(re.search(p, ns, flags=re.IGNORECASE) for p in PAREL_MARK_PATTERNS)
+
 
 def _is_bare_parel(ns: str) -> bool:
     if re.search(r"\bпарел[ьи]\b(?!\s*ма)", ns, flags=re.IGNORECASE):
@@ -333,6 +452,7 @@ def _is_bare_parel(ns: str) -> bool:
     if re.search(r"\bparel{1,2}\b(?!\s*ma)", ns, flags=re.IGNORECASE):
         return True
     return False
+
 
 def is_ref_supplier(s: str) -> bool:
     """
@@ -357,74 +477,111 @@ def is_ref_supplier(s: str) -> bool:
         return True
     return False
 
-def is_market_supplier(s: str)->bool:
-    if not isinstance(s,str) or not s.strip(): return False
+
+def is_market_supplier(s: str) -> bool:
+    if not isinstance(s, str) or not s.strip():
+        return False
     ns = _normalize_name_for_match(s)
     for bad in _EXCL:
-        if _word_boundary_contains(ns, _normalize_name_for_match(bad)): return False
+        if _word_boundary_contains(ns, _normalize_name_for_match(bad)):
+            return False
     for pat in _EXCL_PAT:
-        if re.search(pat, ns, flags=re.IGNORECASE): return False
+        if re.search(pat, ns, flags=re.IGNORECASE):
+            return False
     tokens = [t for t in re.split(r"\s+", ns) if t]
-    def has_prefix(pref: str)->bool:
+
+    def has_prefix(pref: str) -> bool:
         pref = pref.lower()
         return any(t.startswith(pref) for t in tokens)
-    if (has_prefix("лужник") or has_prefix("luzh")) and (has_prefix("и") or has_prefix("ир") or has_prefix("irin") or has_prefix("i")):
+
+    if (has_prefix("лужник") or has_prefix("luzh")) and (
+        has_prefix("и") or has_prefix("ир") or has_prefix("irin") or has_prefix("i")
+    ):
         return True
     if has_prefix("альянс") or has_prefix("alyans"):
-        if has_prefix("груп") or has_prefix("гр") or has_prefix("group") or has_prefix("grp") or has_prefix("gr"):
+        if (
+            has_prefix("груп")
+            or has_prefix("гр")
+            or has_prefix("group")
+            or has_prefix("grp")
+            or has_prefix("gr")
+        ):
             return True
     for key in _MARKET_BASE:
-        if _word_boundary_contains(ns, _normalize_name_for_match(key)): return True
-    if re.fullmatch(r"\s*владимир\s*", ns, flags=re.IGNORECASE): return True
+        if _word_boundary_contains(ns, _normalize_name_for_match(key)):
+            return True
+    if re.fullmatch(r"\s*владимир\s*", ns, flags=re.IGNORECASE):
+        return True
     return False
+
 
 # ========= Флаги Excel =========
 
+
 def _hex_to_rgb(argb: str):
-    if not argb: return None
-    s = re.sub(r"[^0-9A-Fa-f]","", str(argb))
-    s = s[-6:] if len(s)>=6 else s
-    if len(s)!=6: return None
-    try: return (int(s[0:2],16), int(s[2:4],16), int(s[4:6],16))
-    except: return None
-
-def _is_yellowish_rgb(rgb)->bool:
-    if rgb is None: return False
-    r,g,b = rgb
-    return (r>=200 and g>=190 and b<=170) or (r>=245 and g>=240 and b>=200)
-
-def _color_to_hex_upper(col)->str:
-    if not col: return ""
+    if not argb:
+        return None
+    s = re.sub(r"[^0-9A-Fa-f]", "", str(argb))
+    s = s[-6:] if len(s) >= 6 else s
+    if len(s) != 6:
+        return None
     try:
-        rv = getattr(col,"rgb",None)
-        if isinstance(rv,str): return rv.upper()
+        return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+    except:
+        return None
+
+
+def _is_yellowish_rgb(rgb) -> bool:
+    if rgb is None:
+        return False
+    r, g, b = rgb
+    return (r >= 200 and g >= 190 and b <= 170) or (r >= 245 and g >= 240 and b >= 200)
+
+
+def _color_to_hex_upper(col) -> str:
+    if not col:
+        return ""
+    try:
+        rv = getattr(col, "rgb", None)
+        if isinstance(rv, str):
+            return rv.upper()
         if rv is not None:
-            inner = getattr(rv,"rgb",None)
-            if isinstance(inner,str): return inner.upper()
+            inner = getattr(rv, "rgb", None)
+            if isinstance(inner, str):
+                return inner.upper()
             return str(rv).upper()
-    except: pass
+    except:
+        pass
     try:
-        v = getattr(col,"value",None)
-        if isinstance(v,str): return v.upper()
-    except: pass
+        v = getattr(col, "value", None)
+        if isinstance(v, str):
+            return v.upper()
+    except:
+        pass
     return ""
 
-def _cell_is_yellow(cell)->bool:
-    fill = getattr(cell,"fill",None)
+
+def _cell_is_yellow(cell) -> bool:
+    fill = getattr(cell, "fill", None)
     if not fill:
         return False
-    if str(getattr(fill,"fill_type","")).lower()!="solid":
+    if str(getattr(fill, "fill_type", "")).lower() != "solid":
         return False
 
-    for attr in ("fgColor","start_color","end_color"):
+    for attr in ("fgColor", "start_color", "end_color"):
         col = getattr(fill, attr, None)
         if not col:
             continue
         raw = _color_to_hex_upper(col)
-        if raw.endswith("FFFF00") or raw in {"00FFFF00","FFFFFF00","FFFFFF99","FFFFFBF0"}:
+        if raw.endswith("FFFF00") or raw in {
+            "00FFFF00",
+            "FFFFFF00",
+            "FFFFFF99",
+            "FFFFFBF0",
+        }:
             return True
         idx = getattr(col, "indexed", None)
-        if isinstance(idx, int) and idx in (5,6,13,43,44):
+        if isinstance(idx, int) and idx in (5, 6, 13, 43, 44):
             return True
         rgb = _hex_to_rgb(raw)
         if _is_yellowish_rgb(rgb):
@@ -432,17 +589,23 @@ def _cell_is_yellow(cell)->bool:
 
     return False
 
-def _cell_is_strike(cell)->bool:
-    f = getattr(cell,"font",None)
-    return bool(getattr(f,"strike",False) or getattr(f,"strikethrough",False)) if f else False
 
-def add_yellow_flags_to_df(file)->pd.DataFrame:
+def _cell_is_strike(cell) -> bool:
+    f = getattr(cell, "font", None)
+    return (
+        bool(getattr(f, "strike", False) or getattr(f, "strikethrough", False))
+        if f
+        else False
+    )
+
+
+def add_yellow_flags_to_df(file) -> pd.DataFrame:
     wb = load_workbook_safe(file, data_only=True)
     ws = wb.active
     max_col = ws.max_column
     header = [cell.value for cell in ws[1][:max_col]]
-    yellow_header = [f"Yellow Flag Col{col}" for col in range(1,max_col+1)]
-    strike_header = [f"Strike Flag Col{col}" for col in range(1,max_col+1)]
+    yellow_header = [f"Yellow Flag Col{col}" for col in range(1, max_col + 1)]
+    strike_header = [f"Strike Flag Col{col}" for col in range(1, max_col + 1)]
     rows = [header + yellow_header + strike_header]
     for row in ws.iter_rows(min_row=2, max_col=max_col):
         values = [c.value for c in row]
@@ -451,22 +614,36 @@ def add_yellow_flags_to_df(file)->pd.DataFrame:
         rows.append(values + y_flags + s_flags)
     return pd.DataFrame(rows)
 
-def detect_flag_base(data: List[List])->Optional[int]:
-    if not data: return None
-    for j,v in enumerate(data[0]):
-        if isinstance(v,str) and v.strip().startswith("Yellow Flag Col"): return j
+
+def detect_flag_base(data: List[List]) -> Optional[int]:
+    if not data:
+        return None
+    for j, v in enumerate(data[0]):
+        if isinstance(v, str) and v.strip().startswith("Yellow Flag Col"):
+            return j
     return None
 
-def detect_strike_base(data: List[List])->Optional[int]:
-    if not data: return None
-    for j,v in enumerate(data[0]):
-        if isinstance(v,str) and v.strip().startswith("Strike Flag Col"): return j
+
+def detect_strike_base(data: List[List]) -> Optional[int]:
+    if not data:
+        return None
+    for j, v in enumerate(data[0]):
+        if isinstance(v, str) and v.strip().startswith("Strike Flag Col"):
+            return j
     return None
 
-def flag_at(data: List[List], row_idx: int, price_col_idx0: int, flag_base: int)->bool:
+
+def flag_at(
+    data: List[List], row_idx: int, price_col_idx0: int, flag_base: int
+) -> bool:
     idx = flag_base + price_col_idx0
-    val = data[row_idx][idx] if (0<=row_idx<len(data) and len(data[row_idx])>idx) else None
+    val = (
+        data[row_idx][idx]
+        if (0 <= row_idx < len(data) and len(data[row_idx]) > idx)
+        else None
+    )
     return is_true_like(val)
+
 
 # ========= Остатки =========
 # Разрешаем 12,0 и 12.0, но всё равно фильтруем только числа/дефисы
@@ -476,19 +653,39 @@ _SEG = r"(?:[0-9]+(?:[.,]0+)?)|-"
 STOCK_PATTERN = re.compile(rf"^\s*({_SEG})(\s*/\s*({_SEG}))+?\s*$")
 
 ALLOWED_VIRTUAL = {0, 35, 50}
+
+
 def _virtual_ok(v: Optional[int]) -> bool:
     return v in ALLOWED_VIRTUAL
 
-INTERNAL_PRICE_HEADER_TOKENS = {"cost","кост","себестоимость",
-                                "cash","кэш","нал","наличный","наличные",
-                                "f17","ф17","vip","вип","ндс","prime","fox"}
+
+INTERNAL_PRICE_HEADER_TOKENS = {
+    "cost",
+    "кост",
+    "себестоимость",
+    "cash",
+    "кэш",
+    "нал",
+    "наличный",
+    "наличные",
+    "f17",
+    "ф17",
+    "vip",
+    "вип",
+    "ндс",
+    "prime",
+    "fox",
+}
+
 
 def _is_internal_header(text: str) -> bool:
     s = norm(text)
     return any(tok in s for tok in INTERNAL_PRICE_HEADER_TOKENS)
 
+
 # НОВОЕ: формат «1 771 шт» / «1771 pcs»
 PLAIN_STOCK_PATTERN = re.compile(r"^\s*([0-9][0-9\s.,]*)\s*(?:шт|pcs)\b", re.IGNORECASE)
+
 
 def parse_stock_plain(val) -> Optional[int]:
     if not isinstance(val, str):
@@ -499,8 +696,10 @@ def parse_stock_plain(val) -> Optional[int]:
     digits = re.sub(r"[^0-9]", "", m.group(1))
     return int(digits) if digits else None
 
+
 # строгий plain-формат: "1 771 шт" или "1771 pcs" — ЮНИТ обязателен
 PLAIN_STOCK_STRICT = re.compile(r"^\s*([0-9][0-9\s.,]*)\s*(?:шт|pcs)\b", re.IGNORECASE)
+
 
 def parse_stock_plain_strict(val) -> Optional[int]:
     if not isinstance(val, str):
@@ -511,6 +710,7 @@ def parse_stock_plain_strict(val) -> Optional[int]:
         return None
     digits = re.sub(r"[^0-9]", "", m.group(1))
     return int(digits) if digits else None
+
 
 def parse_multi_stock_tokens(val) -> Tuple[Optional[int], Optional[int]]:
     """
@@ -526,9 +726,10 @@ def parse_multi_stock_tokens(val) -> Tuple[Optional[int], Optional[int]]:
             rv = parse_stock_value(tok) or 0
             vv = parse_virtual_stock_value(tok) or 0
             total += rv
-            virt  += vv
+            virt += vv
             found = True
     return (total, virt) if found else (None, None)
+
 
 def parse_stock_value(val) -> Optional[int]:
     """
@@ -565,6 +766,7 @@ def parse_stock_value(val) -> Optional[int]:
         # все сегменты были '-' → это реальный 0
         return 0
 
+
 def parse_virtual_stock_value(val) -> Optional[int]:
     if val is None:
         return None
@@ -579,81 +781,176 @@ def parse_virtual_stock_value(val) -> Optional[int]:
     except:
         return None
 
-def read_stock_robust(data: List[List], pr: int, y_base: int, stock_col_guess: Optional[int]) -> Tuple[Optional[int], Optional[int], Optional[str]]:
+
+def read_stock_cash_style(
+    data: List[List], pr: int, y_base: int, first_row: int
+) -> Tuple[Optional[int], Optional[int], Optional[str]]:
     """
-    Ищем остаток только в «остаточных» колонках:
-      1) сначала stock_col_guess (если найден),
-      2) затем любые колонки, чьи заголовки (верх или строка товара) похожи на «остаток/шт/stock»,
-      3) если и так ничего — сканируем ВСЕ колонки, но принимаем только:
-         - списки A/B/... (STOCK_PATTERN),
-         - либо «plain» со строгим юнитом (шт|pcs).
-    Приоритет кандидатов: plain (юнит) > список; затем — по величине total.
+    Полностью копирует логику чтения остатков из Cash анализа.
+    Возвращает (stock_val, virtual_stock_val, stock_raw)
     """
-    def _candidate_cols():
-        cols = []
-        if stock_col_guess is not None and stock_col_guess >= 0:
-            cols.append(stock_col_guess)
+    # Находим столбец остатков точно как в Cash анализе
+    stock_col = find_col_by_tokens(
+        data, first_row, y_base, STOCK_HEADER_TOKENS, fallback_1based=None
+    )
+    if stock_col == -1:
+        # эвристика: выбираем колонку с макс. числом «остаточных» строк в окне строк
+        scan_top = min(len(data), first_row + 300)
+        best_j, best_cnt = -1, -1
         for j in range(0, y_base):
-            if j in cols:
-                continue
-            top = data[0][j] if (len(data) > 0 and len(data[0]) > j) else None
-            hdr = data[pr][j] if (pr < len(data) and len(data[pr]) > j) else None
-            if _is_stockish_header(top) or _is_stockish_header(hdr):
-                cols.append(j)
-        return cols
+            header_text = _gather_headers_pairwise(data, first_row, j)
+            if _is_internal_header(header_text):
+                continue  # не считаем такие столбцы кандидатами для остатков
+            cnt = 0
+            for r in range(first_row, scan_top):
+                v = data[r][j] if len(data[r]) > j else None
+                if isinstance(v, str) and STOCK_PATTERN.match(v):
+                    cnt += 1
+            if cnt > best_cnt:
+                best_cnt, best_j = cnt, j
+        stock_col = best_j
 
-    cand_cols = _candidate_cols()
-    scan_all  = (len(cand_cols) == 0)
+    # Читаем остатки точно как в Cash анализе
+    stock_val = virtual_stock_val = None
+    stock_raw = None
 
-    candidates = []  # (prio, total, rr, jj, raw, virt), prio: 2=plain, 1=list
+    # 3.1. Пытаемся прочитать ТОЛЬКО из stock_col (pr, pr+1, pr+2)
+    if stock_col is not None and stock_col >= 0:
+        for r_off in (0, 1, 2):
+            rr = pr + r_off
+            if rr >= len(data):
+                break
+            val = data[rr][stock_col] if len(data[rr]) > stock_col else None
+            if isinstance(val, str) and STOCK_PATTERN.match(val):
+                vvirt = parse_virtual_stock_value(val)
+                if _virtual_ok(vvirt):
+                    stock_raw = val
+                    stock_val = parse_stock_value(val)
+                    virtual_stock_val = vvirt
+                    break
 
-    def _check_cell(rr, jj, v):
-        if not isinstance(v, str):
-            return
-        s = v.replace("\xa0", " ")
+    # 3.2. Если не нашли — ДОПУСКАЕМ широкий поиск, но только с проверкой виртуала
+    if stock_val is None:
+        best = None  # (segments, rr, jj, raw)
+        for r_off in (0, 1, 2):
+            rr = pr + r_off
+            if rr >= len(data):
+                break
+            for jj in range(0, y_base):
+                val = data[rr][jj] if len(data[rr]) > jj else None
+                if isinstance(val, str) and STOCK_PATTERN.match(val):
+                    vvirt = parse_virtual_stock_value(val)
+                    if not _virtual_ok(vvirt):
+                        continue
+                    cand = (val.count("/"), rr, jj, val)
+                    if best is None or cand[0] > best[0]:
+                        best = cand
+        if best is not None:
+            _, rr, jj, raw = best
+            stock_raw = raw
+            stock_val = parse_stock_value(raw)
+            virtual_stock_val = parse_virtual_stock_value(raw)
 
-        # несколько списков в одной ячейке
-        tot_m, virt_m = parse_multi_stock_tokens(s)
-        if tot_m is not None:
-            candidates.append((1, tot_m, rr, jj, v, virt_m or 0))
-            return
+    return stock_val, virtual_stock_val, stock_raw
 
-        # строгий plain с юнитом
-        p = parse_stock_plain_strict(s)
-        if p is not None:
-            candidates.append((2, p, rr, jj, v, 0))
 
-    for r_off in (0, 1, 2):
-        rr = pr + r_off
-        if rr >= len(data):
-            break
-        cols_iter = range(0, y_base) if scan_all else cand_cols
-        for jj in cols_iter:
-            if len(data[rr]) <= jj:
-                continue
-            _check_cell(rr, jj, data[rr][jj])
+    """
+    Универсальная функция чтения остатков на основе логики Cash анализа.
+    Возвращает (stock_val, virtual_stock_val, stock_raw)
+    """
+    stock_val = virtual_stock_val = None
+    stock_raw = None
 
-    if not candidates:
-        return None, None, None
+    # Если stock_col не передан или равен -1, определяем его как в Cash анализе
+    if stock_col is None or stock_col == -1:
+        # Находим первую товарную строку
+        first_row = -1
+        for i in range(min(50, len(data))):
+            if is_intlike(data[i][1] if len(data[i]) > 1 else None):
+                first_row = i
+                break
+        
+        if first_row != -1:
+            # Ищем столбец остатков по заголовку или по статистике шаблона
+            stock_col = find_col_by_tokens(
+                data, first_row, y_base, STOCK_HEADER_TOKENS, fallback_1based=None
+            )
+            if stock_col == -1:
+                # эвристика: выбираем колонку с макс. числом «остаточных» строк в окне строк
+                scan_top = min(len(data), first_row + 300)
+                best_j, best_cnt = -1, -1
+                for j in range(0, y_base):
+                    header_text = _gather_headers_pairwise(data, first_row, j)
+                    if _is_internal_header(header_text):
+                        continue  # не считаем такие столбцы кандидатами для остатков
+                    cnt = 0
+                    for r in range(first_row, scan_top):
+                        v = data[r][j] if len(data[r]) > j else None
+                        if isinstance(v, str) and STOCK_PATTERN.match(v):
+                            cnt += 1
+                    if cnt > best_cnt:
+                        best_cnt, best_j = cnt, j
+                stock_col = best_j
 
-    # plain важнее списка; затем максимальный total
-    candidates.sort(key=lambda t: (t[0], t[1]), reverse=True)
-    _prio, total, rr, jj, raw, virt = candidates[0]
-    return total, virt, raw
+    # 1. Пытаемся прочитать ТОЛЬКО из stock_col (pr, pr+1, pr+2)
+    if stock_col is not None and stock_col >= 0:
+        for r_off in (0, 1, 2):
+            rr = pr + r_off
+            if rr >= len(data):
+                break
+            val = data[rr][stock_col] if len(data[rr]) > stock_col else None
+            if isinstance(val, str) and STOCK_PATTERN.match(val):
+                vvirt = parse_virtual_stock_value(val)
+                if _virtual_ok(vvirt):
+                    stock_raw = val
+                    stock_val = parse_stock_value(val)
+                    virtual_stock_val = vvirt
+                    break
+
+    # 2. Если не нашли — ДОПУСКАЕМ широкий поиск, но только с проверкой виртуала
+    if stock_val is None:
+        best = None  # (segments, rr, jj, raw)
+        for r_off in (0, 1, 2):
+            rr = pr + r_off
+            if rr >= len(data):
+                break
+            for jj in range(0, y_base):
+                val = data[rr][jj] if len(data[rr]) > jj else None
+                if isinstance(val, str) and STOCK_PATTERN.match(val):
+                    vvirt = parse_virtual_stock_value(val)
+                    if not _virtual_ok(vvirt):
+                        continue
+                    cand = (val.count("/"), rr, jj, val)
+                    if best is None or cand[0] > best[0]:
+                        best = cand
+        if best is not None:
+            _, rr, jj, raw = best
+            stock_raw = raw
+            stock_val = parse_stock_value(raw)
+            virtual_stock_val = parse_virtual_stock_value(raw)
+
+    return stock_val, virtual_stock_val, stock_raw
+
+
 
 # ========= Поиск колонок =========
 # ========= Поиск колонок COST / CASH =========
-COST_HEADER_TOKENS  = {"cost", "себестоим", "себест", "с/стоим", "себес"}
-CASH_HEADER_TOKENS  = {"cash", "кэш", "нал", "наличный", "наличные"}
-F17_HEADER_TOKENS  = {"f17", "f 17", "f-17", "f17 €", "f17, €", "ф17", "ф 17", "ф-17"}
+COST_HEADER_TOKENS = {"cost", "себестоим", "себест", "с/стоим", "себес"}
+CASH_HEADER_TOKENS = {"cash", "кэш", "нал", "наличный", "наличные"}
+F17_HEADER_TOKENS = {"f17", "f 17", "f-17", "f17 €", "f17, €", "ф17", "ф 17", "ф-17"}
 ZAKUP_HEADER_TOKENS = {"закупочная", "закуп", "закупка"}
 VIP_HEADER_TOKENS = {"vip", "vip цена", "vip price"}
 STOCK_HEADER_TOKENS = {"остаток", "остатки", "stock"}
 STOCK_HEADER_TOKENS_EXT = {"остаток", "остатки", "stock", "шт", "pcs"}
 
+
 def _is_stockish_header(text: str) -> bool:
-    return isinstance(text, str) and any(tok in norm(text) for tok in STOCK_HEADER_TOKENS_EXT)
-FALLBACK_VIP_COL_1BASED  = 36
+    return isinstance(text, str) and any(
+        tok in norm(text) for tok in STOCK_HEADER_TOKENS_EXT
+    )
+
+
+FALLBACK_VIP_COL_1BASED = 36
 
 # ========= ЗАМОРОЗКА КОНСТАНТ =========
 # Замораживаем критические константы, чтобы изменения глобалок не влияли на Cash/VIP
@@ -670,12 +967,25 @@ _VIP_FALLBACK_COL_FROZEN = FALLBACK_VIP_COL_1BASED
 
 COST_OK_TOKENS = {"cost", "себестоимость", "кост"}
 COST_BAD_KEYWORDS = {
-    "eur","€","usd","$","доллар","евро","cny",
-    "old","стар","архив","prev","предыд","hist","history"
+    "eur",
+    "€",
+    "usd",
+    "$",
+    "доллар",
+    "евро",
+    "cny",
+    "old",
+    "стар",
+    "архив",
+    "prev",
+    "предыд",
+    "hist",
+    "history",
 }
 
+
 def _is_clean_cost_header(text: str) -> bool:
-    if not isinstance(text, str): 
+    if not isinstance(text, str):
         return False
     s = norm(text)
     if not any(tok in s for tok in COST_OK_TOKENS):
@@ -687,13 +997,17 @@ def _is_clean_cost_header(text: str) -> bool:
         return False
     return True
 
+
 def _gather_headers_pairwise(data: List[List], pr: int, j: int) -> str:
-    top = data[0][j] if (len(data)>0 and len(data[0])>j) else None
-    hdr = data[pr][j] if (pr < len(data) and len(data[pr])>j) else None
+    top = data[0][j] if (len(data) > 0 and len(data[0]) > j) else None
+    hdr = data[pr][j] if (pr < len(data) and len(data[pr]) > j) else None
     parts = []
-    if top: parts.append(str(top))
-    if hdr and hdr != top: parts.append(str(hdr))
+    if top:
+        parts.append(str(top))
+    if hdr and hdr != top:
+        parts.append(str(hdr))
     return " / ".join(parts) if parts else ""
+
 
 def find_cost_cols_clean(data: List[List], pr: int, y_base: int) -> List[int]:
     cols = []
@@ -701,15 +1015,20 @@ def find_cost_cols_clean(data: List[List], pr: int, y_base: int) -> List[int]:
         header_text = _gather_headers_pairwise(data, pr, j)
         if _is_clean_cost_header(header_text):
             cols.append(j)
+
     # приоритезируем «идеальные» заголовки
     def _score(j):
         h = norm(_gather_headers_pairwise(data, pr, j))
         score = 0
-        if h in {"cost","себестоимость"}: score += 100
-        if "руб" in h or "₽" in h or " rub" in h: score += 20
+        if h in {"cost", "себестоимость"}:
+            score += 100
+        if "руб" in h or "₽" in h or " rub" in h:
+            score += 20
         return score
+
     cols.sort(key=_score, reverse=True)
     return cols
+
 
 def read_cost_value_strict(
     data: List[List], pr: int, y_base: int, s_base: int
@@ -725,7 +1044,7 @@ def read_cost_value_strict(
 
     for r_off in (1, 2):
         rr = pr + r_off
-        if rr >= len(data): 
+        if rr >= len(data):
             continue
         for col in cols:
             if len(data[rr]) <= col:
@@ -739,52 +1058,72 @@ def read_cost_value_strict(
                 return float(val), col, "YELLOW", rr
     return None, (cols[0] if cols else None), "NOT_FOUND_YELLOW", None
 
+
 # === Стоимостные заголовки (умный выбор) ===
-COST_POSITIVE_PAT = [
-    r"\bcost\b", r"себест", r"себестоим", r"\bс/с\b", r"prime\s*cost"
-]
+COST_POSITIVE_PAT = [r"\bcost\b", r"себест", r"себестоим", r"\bс/с\b", r"prime\s*cost"]
 COST_RUBLE_HINT_PAT = [r"руб", r"₽", r"\brub\b"]
-COST_NEGATIVE_PAT = [
-    r"\bold\b", r"стар", r"prev", r"предыд", r"архив", r"hist"
-]
+COST_NEGATIVE_PAT = [r"\bold\b", r"стар", r"prev", r"предыд", r"архив", r"hist"]
 COST_BAD_CCY_PAT = [r"€", r"\beur\b", r"\$", r"\busd\b", r"cny", r"евро", r"доллар"]
-COST_MINLIKE_PAT = [r"\bmin\b", r"\bмин\b", r"min15", r"1[.,]?5", r"порог", r"floor", r"target"]
+COST_MINLIKE_PAT = [
+    r"\bmin\b",
+    r"\bмин\b",
+    r"min15",
+    r"1[.,]?5",
+    r"порог",
+    r"floor",
+    r"target",
+]
+
 
 def _score_cost_header(text: str) -> Optional[int]:
-    if not isinstance(text, str): return None
+    if not isinstance(text, str):
+        return None
     s = norm(text)
     score = 0
     if not any(re.search(p, s, flags=re.IGNORECASE) for p in COST_POSITIVE_PAT):
         return None  # вообще не «cost»-похоже — не рассматриваем
     score += 100
-    if any(re.search(p, s, flags=re.IGNORECASE) for p in COST_RUBLE_HINT_PAT): score += 50
-    if any(re.search(p, s, flags=re.IGNORECASE) for p in COST_NEGATIVE_PAT):  score -= 300
-    if any(re.search(p, s, flags=re.IGNORECASE) for p in COST_BAD_CCY_PAT):   score -= 500  # режем €/$
-    if any(re.search(p, s, flags=re.IGNORECASE) for p in COST_MINLIKE_PAT):   score -= 200
+    if any(re.search(p, s, flags=re.IGNORECASE) for p in COST_RUBLE_HINT_PAT):
+        score += 50
+    if any(re.search(p, s, flags=re.IGNORECASE) for p in COST_NEGATIVE_PAT):
+        score -= 300
+    if any(re.search(p, s, flags=re.IGNORECASE) for p in COST_BAD_CCY_PAT):
+        score -= 500  # режем €/$
+    if any(re.search(p, s, flags=re.IGNORECASE) for p in COST_MINLIKE_PAT):
+        score -= 200
     # «идеальные» варианты — чисто Cost / Себестоимость
-    if s in {"cost","себестоимость"}: score += 30
+    if s in {"cost", "себестоимость"}:
+        score += 30
     return score
 
-def find_cost_col_smart(data: List[List], pr: int, y_base: int) -> Tuple[int, Optional[str]]:
+
+def find_cost_col_smart(
+    data: List[List], pr: int, y_base: int
+) -> Tuple[int, Optional[str]]:
     """
     Находит ЛУЧШУЮ колонку Cost по хедеру: +RUB, −OLD/€/архив/мин15.
     Смотрим верхнюю строку и строку заголовков блока товара.
     Возвращает (col_idx0 | -1, header_text | None)
     """
-    best_col, best_score, best_header = -1, -10**9, None
+    best_col, best_score, best_header = -1, -(10**9), None
     for j in range(0, y_base):
         cand_parts = []
-        top = data[0][j] if (len(data)>0 and len(data[0])>j) else None
-        hdr = data[pr][j] if (pr < len(data) and len(data[pr])>j) else None
-        if top: cand_parts.append(str(top))
-        if hdr and hdr != top: cand_parts.append(str(hdr))
-        if not cand_parts: continue
+        top = data[0][j] if (len(data) > 0 and len(data[0]) > j) else None
+        hdr = data[pr][j] if (pr < len(data) and len(data[pr]) > j) else None
+        if top:
+            cand_parts.append(str(top))
+        if hdr and hdr != top:
+            cand_parts.append(str(hdr))
+        if not cand_parts:
+            continue
         header_text = " / ".join(cand_parts)
         sc = _score_cost_header(header_text)
-        if sc is None: continue
+        if sc is None:
+            continue
         if sc > best_score:
             best_score, best_col, best_header = sc, j, header_text
     return best_col, best_header
+
 
 def _norm_hdr(text: str) -> str:
     s = str(text or "")
@@ -792,34 +1131,46 @@ def _norm_hdr(text: str) -> str:
     # убираем валюты/знаки и пунктуацию, схлопываем пробелы
     s = re.sub(r"[€$₽р.,;:()\\[\\]\\-]+", " ", s)
     s = s.replace("руб", " ").replace("eur", " ").replace("руд", " ")
-    s = s.replace("/", "")   # с/стоим → сстоим
+    s = s.replace("/", "")  # с/стоим → сстоим
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
 
 def _hdr_has_token(text: str, tokens: set) -> bool:
     s = _norm_hdr(text)
     return any(tok in s for tok in tokens)
 
+
 def _is_cost_header(text: str) -> bool:
     return isinstance(text, str) and (norm(text) in COST_HEADER_TOKENS)
+
 
 def _is_vip_header(text: str) -> bool:
     return isinstance(text, str) and norm(text).replace(" ", "").startswith("vip")
 
-def find_col_by_tokens(data: List[List], pr: int, y_base: int, tokens: set,
-                       fallback_1based: Optional[int]=None) -> int:
+
+def find_col_by_tokens(
+    data: List[List],
+    pr: int,
+    y_base: int,
+    tokens: set,
+    fallback_1based: Optional[int] = None,
+) -> int:
     """
     1) ищем по верхней строке (глобальные заголовки),
     2) если не нашли — пробуем строку товара (локальные заголовки),
     3) если всё ещё нет — берём fallback.
     """
+
     def _scan_row(row) -> int:
-        if not row: return -1
+        if not row:
+            return -1
         col = -1
         for j in range(0, y_base):
             h = row[j] if j < len(row) else None
             if _hdr_has_token(h, tokens):
-                col = j; break
+                col = j
+                break
         return col
 
     top = data[0] if data else []
@@ -830,6 +1181,7 @@ def find_col_by_tokens(data: List[List], pr: int, y_base: int, tokens: set,
     if col == -1 and fallback_1based is not None:
         col = fallback_1based - 1
     return col
+
 
 def find_cost_vip_cols(data: List[List], pr: int, y_base: int) -> Tuple[int, int]:
     cost_col = vip_col = -1
@@ -854,7 +1206,9 @@ def find_cost_vip_cols(data: List[List], pr: int, y_base: int) -> Tuple[int, int
         vip_col = FALLBACK_VIP_COL_1B - 1
     return cost_col, vip_col
 
+
 # ========= Сбор цен рынка =========
+
 
 def extract_market_prices_for_product(
     data: List[List], pr: int, y_base: int, require_both_flags: bool = True
@@ -868,8 +1222,8 @@ def extract_market_prices_for_product(
             nm = data[rr][j] if len(data[rr]) > j else None
             if nm is None:
                 continue
-            fh = flag_at(data, rr, j, y_base)       # жёлтый у ИМЕНИ
-            fn = flag_at(data, rr + 1, j, y_base)   # жёлтый у ЦЕНЫ
+            fh = flag_at(data, rr, j, y_base)  # жёлтый у ИМЕНИ
+            fn = flag_at(data, rr + 1, j, y_base)  # жёлтый у ЦЕНЫ
             ok = (fh and fn) if require_both_flags else (fh or fn)
             if not ok:
                 continue
@@ -882,7 +1236,10 @@ def extract_market_prices_for_product(
         rr += 1
     return out
 
-def extract_market_prices_for_product_f17(data: List[List], pr: int, y_base: int, s_base: int) -> List[Tuple[str, float]]:
+
+def extract_market_prices_for_product_f17(
+    data: List[List], pr: int, y_base: int, s_base: int
+) -> List[Tuple[str, float]]:
     """
     Строгое правило:
       - берём ЦЕНУ только если ячейка цены жёлтая и НЕ зачёркнута
@@ -891,13 +1248,28 @@ def extract_market_prices_for_product_f17(data: List[List], pr: int, y_base: int
     """
     out: List[Tuple[str, float]] = []
     rr = pr + 2
-    INTERNAL_TOKENS = {"cost","кост","себестоимость","cash","кэш","нал","наличный","наличные","f17","ф17","vip","вип","ндс","prime"}
+    INTERNAL_TOKENS = {
+        "cost",
+        "кост",
+        "себестоимость",
+        "cash",
+        "кэш",
+        "нал",
+        "наличный",
+        "наличные",
+        "f17",
+        "ф17",
+        "vip",
+        "вип",
+        "ндс",
+        "prime",
+    }
 
     def _is_internal(col_name: str) -> bool:
         ns = norm(col_name)
         return any(tok in ns for tok in INTERNAL_TOKENS)
 
-    while rr < len(data) and not is_intlike(data[rr][1] if len(data[rr])>1 else None):
+    while rr < len(data) and not is_intlike(data[rr][1] if len(data[rr]) > 1 else None):
         if rr + 1 >= len(data):
             break
         for j in range(0, y_base):
@@ -929,7 +1301,10 @@ def extract_market_prices_for_product_f17(data: List[List], pr: int, y_base: int
         rr += 1
     return out
 
-def extract_market_prices_for_product_zakup(data: List[List], pr: int, y_base: int) -> List[Tuple[str, float]]:
+
+def extract_market_prices_for_product_zakup(
+    data: List[List], pr: int, y_base: int
+) -> List[Tuple[str, float]]:
     """
     Zakup: берём цену, если жёлтым помечено имя ИЛИ цена.
     (это мягче, чем общий сбор, где могли требовать обе жёлтыми)
@@ -959,37 +1334,50 @@ def extract_market_prices_for_product_zakup(data: List[List], pr: int, y_base: i
         rr += 1
     return out
 
+
 # ========= Вспомогалки для Cash =========
+
 
 def insertion_rank(prices_sorted: List[float], x: float) -> int:
     arr = sorted(prices_sorted + [x])
-    for i,v in enumerate(arr):
-        if abs(v - x) < 1e-9: return i+1
+    for i, v in enumerate(arr):
+        if abs(v - x) < 1e-9:
+            return i + 1
     return len(arr)
+
 
 # ======== CASH BLOCK — DO NOT MODIFY ========
 # (ниже — функции и константы, отвечающие только за Cash)
 
-def trim_by_gap(prices_sorted: List[float], GAP_THRESHOLD=_GAP_THRESHOLD_FROZEN) -> Tuple[List[float], Optional[str]]:
+
+def trim_by_gap(
+    prices_sorted: List[float], GAP_THRESHOLD=_GAP_THRESHOLD_FROZEN
+) -> Tuple[List[float], Optional[str]]:
     n = len(prices_sorted)
-    if n < 2: return prices_sorted, None
+    if n < 2:
+        return prices_sorted, None
     if n == 2:
         lo, hi = prices_sorted[0], prices_sorted[1]
-        gap = (hi - lo) / hi if hi>0 else 0.0
-        if gap >= GAP_THRESHOLD: return [lo], "N2_GAP_GE40_DROP_MAX"
+        gap = (hi - lo) / hi if hi > 0 else 0.0
+        if gap >= GAP_THRESHOLD:
+            return [lo], "N2_GAP_GE40_DROP_MAX"
         return prices_sorted, None
     gaps = []
-    for i in range(n-1):
-        lo, hi = prices_sorted[i], prices_sorted[i+1]
-        gap = (hi - lo)/hi if hi>0 else 0.0
+    for i in range(n - 1):
+        lo, hi = prices_sorted[i], prices_sorted[i + 1]
+        gap = (hi - lo) / hi if hi > 0 else 0.0
         gaps.append((i, gap))
     i_max, max_gap = max(gaps, key=lambda t: t[1])
     if max_gap >= GAP_THRESHOLD:
-        if i_max == n-2: return prices_sorted[:-1], "DROP_MAX_BY_GAP40"
-        if i_max == 0:   return prices_sorted[1:],  "DROP_MIN_BY_GAP40"
+        if i_max == n - 2:
+            return prices_sorted[:-1], "DROP_MAX_BY_GAP40"
+        if i_max == 0:
+            return prices_sorted[1:], "DROP_MIN_BY_GAP40"
     return prices_sorted, None
 
+
 # ========= Cash анализ =========
+
 
 def cash_choose_price_p2(
     competitor_prices: List[float],
@@ -1068,8 +1456,11 @@ def cash_choose_price_p2(
     achieved_rank = insertion_rank(base_sorted, cash_final)
     return cash_final, " | ".join(steps), achieved_rank
 
+
 # ===== CASH-ONLY collectors =====
-def cash_collect_market_prices(data: List[List], pr: int, y_base: int) -> List[Tuple[str, float]]:
+def cash_collect_market_prices(
+    data: List[List], pr: int, y_base: int
+) -> List[Tuple[str, float]]:
     """
     CASH-ONLY: собираем пары (supplier, price) по правилу:
       - имя ИЛИ цена жёлтая (strike игнорируем),
@@ -1086,8 +1477,8 @@ def cash_collect_market_prices(data: List[List], pr: int, y_base: int) -> List[T
             nm = data[rr][j] if len(data[rr]) > j else None
             if nm is None:
                 continue
-            fh = flag_at(data, rr, j, y_base)       # жёлтое имя
-            fn = flag_at(data, rr + 1, j, y_base)   # жёлтая цена
+            fh = flag_at(data, rr, j, y_base)  # жёлтое имя
+            fn = flag_at(data, rr + 1, j, y_base)  # жёлтая цена
             if not (fh or fn):
                 continue
             price = parse_price(data[rr + 1][j] if len(data[rr + 1]) > j else None)
@@ -1099,11 +1490,21 @@ def cash_collect_market_prices(data: List[List], pr: int, y_base: int) -> List[T
         rr += 1
     return out
 
+
 # ======== END CASH BLOCK ========
 
 # ========= Zakup логика выбора цен =========
 # Исключения для закупки (только для закупки, не для других цен)
-ZAKUP_EXCLUDED_SUPPLIERS = {"белка", "belka", "авангард", "avangard", "андрей", "andrey", "andrei"}
+ZAKUP_EXCLUDED_SUPPLIERS = {
+    "белка",
+    "belka",
+    "авангард",
+    "avangard",
+    "андрей",
+    "andrey",
+    "andrei",
+}
+
 
 def is_zakup_excluded_supplier(s: str) -> bool:
     """Проверяет, исключен ли поставщик для закупки"""
@@ -1112,7 +1513,10 @@ def is_zakup_excluded_supplier(s: str) -> bool:
     ns = _normalize_name_for_match(s)
     return any(excluded in ns for excluded in ZAKUP_EXCLUDED_SUPPLIERS)
 
-def pick_zakup_from_sorted_prices(sorted_prices: List[float]) -> Tuple[Optional[float], str]:
+
+def pick_zakup_from_sorted_prices(
+    sorted_prices: List[float],
+) -> Tuple[Optional[float], str]:
     """Выбор позиции из отсортированных цен для закупки"""
     n = len(sorted_prices)
     if n == 0:
@@ -1127,7 +1531,12 @@ def pick_zakup_from_sorted_prices(sorted_prices: List[float]) -> Tuple[Optional[
         return sorted_prices[1], "N2_TAKE_2ND"
     return sorted_prices[0], "N1_ONLY_PRICE_USED"
 
-def analyze_cash_df(df: pd.DataFrame) -> pd.DataFrame:
+
+def initialize_analysis_data(df: pd.DataFrame) -> Tuple[List[List], int, int, int, int]:
+    """
+    Общая функция инициализации данных для всех типов анализа.
+    Возвращает (data, y_base, s_base, first_row, stock_col)
+    """
     data = df.values.tolist()
     y_base = detect_flag_base(data)
     s_base = detect_strike_base(data)
@@ -1137,13 +1546,16 @@ def analyze_cash_df(df: pd.DataFrame) -> pd.DataFrame:
     # первая товарная строка
     first_row = -1
     for i in range(min(50, len(data))):
-        if is_intlike(data[i][1] if len(data[i])>1 else None):
-            first_row = i; break
+        if is_intlike(data[i][1] if len(data[i]) > 1 else None):
+            first_row = i
+            break
     if first_row == -1:
         raise ValueError("Не найден первый товар в первых 50 строках.")
 
     # найти столбец остатков по заголовку или по статистике шаблона
-    stock_col = find_col_by_tokens(data, first_row, y_base, STOCK_HEADER_TOKENS, fallback_1based=None)
+    stock_col = find_col_by_tokens(
+        data, first_row, y_base, STOCK_HEADER_TOKENS, fallback_1based=None
+    )
     if stock_col == -1:
         # эвристика: выбираем колонку с макс. числом «остаточных» строк в окне строк
         scan_top = min(len(data), first_row + 300)
@@ -1161,20 +1573,29 @@ def analyze_cash_df(df: pd.DataFrame) -> pd.DataFrame:
                 best_cnt, best_j = cnt, j
         stock_col = best_j
 
+    return data, y_base, s_base, first_row, stock_col
+
+
+def analyze_cash_df(df: pd.DataFrame) -> pd.DataFrame:
+    data, y_base, s_base, first_row, stock_col = initialize_analysis_data(df)
+
     # список товаров
     product_rows: List[int] = []
     r = first_row
     while r < len(data):
-        if is_intlike(data[r][1] if len(data[r])>1 else None):
-            product_rows.append(r); r += 1
-            while r < len(data) and not is_intlike(data[r][1] if len(data[r])>1 else None):
+        if is_intlike(data[r][1] if len(data[r]) > 1 else None):
+            product_rows.append(r)
+            r += 1
+            while r < len(data) and not is_intlike(
+                data[r][1] if len(data[r]) > 1 else None
+            ):
                 r += 1
         else:
             r += 1
 
-    results=[]
+    results = []
     for pr in product_rows:
-        code = data[pr][2] if len(data[pr])>2 else None
+        code = data[pr][2] if len(data[pr]) > 2 else None
         name = extract_name_row(data, pr, 4)
         brand = guess_brand(name)
 
@@ -1186,7 +1607,8 @@ def analyze_cash_df(df: pd.DataFrame) -> pd.DataFrame:
         if stock_col is not None and stock_col >= 0:
             for r_off in (0, 1, 2):
                 rr = pr + r_off
-                if rr >= len(data): break
+                if rr >= len(data):
+                    break
                 val = data[rr][stock_col] if len(data[rr]) > stock_col else None
                 if isinstance(val, str) and STOCK_PATTERN.match(val):
                     vvirt = parse_virtual_stock_value(val)
@@ -1201,7 +1623,8 @@ def analyze_cash_df(df: pd.DataFrame) -> pd.DataFrame:
             best = None  # (segments, rr, jj, raw)
             for r_off in (0, 1, 2):
                 rr = pr + r_off
-                if rr >= len(data): break
+                if rr >= len(data):
+                    break
                 for jj in range(0, y_base):
                     val = data[rr][jj] if len(data[rr]) > jj else None
                     if isinstance(val, str) and STOCK_PATTERN.match(val):
@@ -1225,7 +1648,12 @@ def analyze_cash_df(df: pd.DataFrame) -> pd.DataFrame:
         cost_src = "NOT_FOUND_YELLOW"
         cost_row_idx = None
 
-        if cost_col is not None and cost_col >= 0 and pr + 1 < len(data) and len(data[pr + 1]) > cost_col:
+        if (
+            cost_col is not None
+            and cost_col >= 0
+            and pr + 1 < len(data)
+            and len(data[pr + 1]) > cost_col
+        ):
             tmp = parse_float(data[pr + 1][cost_col])
             raw_cost = float(tmp) if (tmp is not None and tmp > 0) else None
             is_y = flag_at(data, pr + 1, cost_col, y_base)  # жёлтая обязательна
@@ -1236,9 +1664,16 @@ def analyze_cash_df(df: pd.DataFrame) -> pd.DataFrame:
                 cost_row_idx = pr + 1
 
         # Cash_old: CASH-ONLY — берём число из pr+1, если не зачёркнуто (жёлтизна не обязательна)
-        cash_col = find_col_by_tokens(data, pr, y_base, CASH_HEADER_TOKENS, fallback_1based=None)
+        cash_col = find_col_by_tokens(
+            data, pr, y_base, CASH_HEADER_TOKENS, fallback_1based=None
+        )
         cash_old = None
-        if cash_col is not None and cash_col >= 0 and pr + 1 < len(data) and len(data[pr + 1]) > cash_col:
+        if (
+            cash_col is not None
+            and cash_col >= 0
+            and pr + 1 < len(data)
+            and len(data[pr + 1]) > cash_col
+        ):
             v = parse_float(data[pr + 1][cash_col])
             is_s = flag_at(data, pr + 1, cash_col, s_base)  # не допускаем зачёркнутую
             if v is not None and v > 0 and not is_s:
@@ -1246,33 +1681,60 @@ def analyze_cash_df(df: pd.DataFrame) -> pd.DataFrame:
 
         # рынок
         market_pairs = cash_collect_market_prices(data, pr, y_base)
-        market_prices = [p for (_,p) in market_pairs]
+        market_prices = [p for (_, p) in market_pairs]
         market_sorted_pairs = sorted(market_pairs, key=lambda t: t[1])
         prices_sorted = sorted(market_prices)
 
         # Stock==0 → не ставим цену
         if stock_val == 0:
-            results.append({
-                "Code": code, "Name": name, "Brand": brand,
-                "Stock": stock_val, "Virtual_Stock": virtual_stock_val,
-                "Cost": cost_val, "Cash_old": cash_old,
-                "Market_Count": len(prices_sorted),
-                "Market_Prices": "; ".join(map(lambda x: str(round_half_down_0_01(x)), prices_sorted)) if prices_sorted else None,                                                            
-                "Market_suppliers_used": "; ".join([f"{n}:{p}" for n,p in market_sorted_pairs]) if market_pairs else None,                                                                    
-                "Cash_new": None, "Rank_num": None, "Target": None,
-                "MinMargin": None, "RankFeasible": None,
-                "Margin_to_Cost": None, "Is_Margin_OK": None, "Delta": None,
-                "Cost_col_idx": cost_col,
-                "Cost_src": cost_src,
-                "Cost_row_idx": cost_row_idx,
-                "Rule": "STOCK_EQ_0_SKIP", "Reason": "STOCK_EQ_0"
-            }); continue
-
+            results.append(
+                {
+                    "Code": code,
+                    "Name": name,
+                    "Brand": brand,
+                    "Stock": stock_val,
+                    "Virtual_Stock": virtual_stock_val,
+                    "Cost": cost_val,
+                    "Cash_old": cash_old,
+                    "Market_Count": len(prices_sorted),
+                    "Market_Prices": (
+                        "; ".join(
+                            map(lambda x: str(round_half_down_0_01(x)), prices_sorted)
+                        )
+                        if prices_sorted
+                        else None
+                    ),
+                    "Market_suppliers_used": (
+                        "; ".join([f"{n}:{p}" for n, p in market_sorted_pairs])
+                        if market_pairs
+                        else None
+                    ),
+                    "Cash_new": None,
+                    "Rank_num": None,
+                    "Target": None,
+                    "MinMargin": None,
+                    "RankFeasible": None,
+                    "Margin_to_Cost": None,
+                    "Is_Margin_OK": None,
+                    "Delta": None,
+                    "Cost_col_idx": cost_col,
+                    "Cost_src": cost_src,
+                    "Cost_row_idx": cost_row_idx,
+                    "Rule": "STOCK_EQ_0_SKIP",
+                    "Reason": "STOCK_EQ_0",
+                }
+            )
+            continue
 
         # Нет рынка (или <2) → фоллбек
         if len(prices_sorted) < MIN_SUPPLIERS:
-            min_cost15 = (cost_val*(1.0+CASH_MIN_MARGIN_PCT)) if (cost_val is not None) else None
-            fallback=None; reason=f"NO_MARKET_OR_LT_{MIN_SUPPLIERS}_SUPPLIERS"
+            min_cost15 = (
+                (cost_val * (1.0 + CASH_MIN_MARGIN_PCT))
+                if (cost_val is not None)
+                else None
+            )
+            fallback = None
+            reason = f"NO_MARKET_OR_LT_{MIN_SUPPLIERS}_SUPPLIERS"
             if cash_old is not None:
                 # удерживаем минимум к Cost+1.5% если есть Cost
                 if min_cost15 is not None:
@@ -1282,88 +1744,199 @@ def analyze_cash_df(df: pd.DataFrame) -> pd.DataFrame:
                     fallback = floor1(cash_old)
                     reason += " | USE_CASH_OLD"
             elif cost_val is not None:
-                fallback=floor1(cost_val*(1.0+CASH_MIN_MARGIN_PCT)); reason += " | USE_COST_PLUS_1P5"
-            results.append({
-                "Code": code, "Name": name, "Brand": brand,
-                "Stock": stock_val, "Virtual_Stock": virtual_stock_val,
-                "Cost": cost_val, "Cash_old": cash_old,
+                fallback = floor1(cost_val * (1.0 + CASH_MIN_MARGIN_PCT))
+                reason += " | USE_COST_PLUS_1P5"
+            results.append(
+                {
+                    "Code": code,
+                    "Name": name,
+                    "Brand": brand,
+                    "Stock": stock_val,
+                    "Virtual_Stock": virtual_stock_val,
+                    "Cost": cost_val,
+                    "Cash_old": cash_old,
+                    "Market_Count": len(prices_sorted),
+                    "Market_Prices": (
+                        "; ".join(
+                            map(lambda x: str(round_half_down_0_01(x)), prices_sorted)
+                        )
+                        if prices_sorted
+                        else None
+                    ),
+                    "Market_suppliers_used": (
+                        "; ".join([f"{n}:{p}" for n, p in market_sorted_pairs])
+                        if market_pairs
+                        else None
+                    ),
+                    "Cash_new": fallback,
+                    "Rank_num": None,
+                    "Target": None,
+                    "MinMargin": floor1(min_cost15) if min_cost15 is not None else None,
+                    "RankFeasible": None,
+                    "Margin_to_Cost": (
+                        (fallback - cost_val)
+                        if (fallback is not None and cost_val is not None)
+                        else None
+                    ),
+                    "Is_Margin_OK": (
+                        (
+                            fallback is not None
+                            and cost_val is not None
+                            and (fallback - cost_val) >= cost_val * CASH_MIN_MARGIN_PCT
+                        )
+                        if fallback is not None and cost_val is not None
+                        else None
+                    ),
+                    "Delta": (
+                        (fallback - cash_old)
+                        if (fallback is not None and cash_old is not None)
+                        else None
+                    ),
+                    "Cost_col_idx": cost_col,
+                    "Cost_src": cost_src,
+                    "Cost_row_idx": cost_row_idx,
+                    "Rule": "CASH_FALLBACK",
+                    "Reason": reason,
+                }
+            )
+            continue
+
+        # P2-таргет
+        cash_candidate, reason, rank = cash_choose_price_p2(
+            prices_sorted, cost_val, cash_old
+        )
+        if cash_candidate is None:
+            # подстраховка
+            min_cost15 = (
+                (cost_val * (1.0 + CASH_MIN_MARGIN_PCT))
+                if (cost_val is not None)
+                else None
+            )
+            fallback = None
+            reason_fb = "P2_NONE_FALLBACK"
+            if cash_old is not None:
+                if min_cost15 is not None:
+                    fallback = floor1(max(cash_old, floor1(min_cost15)))
+                    reason_fb += " | USE_CASH_OLD_AND_ENSURE_MIN_1P5"
+                else:
+                    fallback = floor1(cash_old)
+                    reason_fb += " | USE_CASH_OLD"
+            elif cost_val is not None:
+                fallback = floor1(cost_val * (1.0 + CASH_MIN_MARGIN_PCT))
+                reason_fb += " | USE_COST_PLUS_1P5"
+            cash_candidate = fallback
+            reason = f"{reason} | {reason_fb}" if reason else reason_fb
+
+        margin_abs = (
+            (cash_candidate - cost_val)
+            if (cash_candidate is not None and cost_val is not None)
+            else None
+        )
+        is_margin_ok = (
+            (
+                margin_abs is not None
+                and cost_val is not None
+                and margin_abs >= cost_val * CASH_MIN_MARGIN_PCT
+            )
+            if margin_abs is not None
+            else None
+        )
+        delta = (
+            (cash_candidate - cash_old)
+            if (cash_candidate is not None and cash_old is not None)
+            else None
+        )
+
+        results.append(
+            {
+                "Code": code,
+                "Name": name,
+                "Brand": brand,
+                "Stock": stock_val,
+                "Virtual_Stock": virtual_stock_val,
+                "Cost": cost_val,
+                "Cash_old": cash_old,
                 "Market_Count": len(prices_sorted),
-                "Market_Prices": "; ".join(map(lambda x: str(round_half_down_0_01(x)), prices_sorted)) if prices_sorted else None,                                                            
-                "Market_suppliers_used": "; ".join([f"{n}:{p}" for n,p in market_sorted_pairs]) if market_pairs else None,                                                                    
-                "Cash_new": fallback, "Rank_num": None, "Target": None,
-                "MinMargin": floor1(min_cost15) if min_cost15 is not None else None, "RankFeasible": None,                                                                                    
-                "Margin_to_Cost": (fallback - cost_val) if (fallback is not None and cost_val is not None) else None,                                                                         
-                "Is_Margin_OK": (fallback is not None and cost_val is not None and (fallback - cost_val) >= cost_val*CASH_MIN_MARGIN_PCT) if fallback is not None and cost_val is not None else None,                                                                                          
-                "Delta": (fallback - cash_old) if (fallback is not None and cash_old is not None) else None,                                                                                  
+                "Market_Prices": (
+                    "; ".join(
+                        map(lambda x: str(round_half_down_0_01(x)), prices_sorted)
+                    )
+                    if prices_sorted
+                    else None
+                ),
+                "Market_suppliers_used": (
+                    "; ".join([f"{n}:{p}" for n, p in market_sorted_pairs])
+                    if market_pairs
+                    else None
+                ),
+                "Cash_new": cash_candidate,
+                "Rank_num": rank,
+                "Target": "P2",  # явная цель
+                "MinMargin": (
+                    floor1(cost_val * (1.0 + CASH_MIN_MARGIN_PCT))
+                    if cost_val is not None
+                    else None
+                ),
+                "RankFeasible": None,
+                "Margin_to_Cost": margin_abs,
+                "Is_Margin_OK": is_margin_ok,
+                "Delta": delta,
                 "Cost_col_idx": cost_col,
                 "Cost_src": cost_src,
                 "Cost_row_idx": cost_row_idx,
-                "Rule": "CASH_FALLBACK", "Reason": reason
-            }); continue
-
-        # P2-таргет
-        cash_candidate, reason, rank = cash_choose_price_p2(prices_sorted, cost_val, cash_old)
-        if cash_candidate is None:
-            # подстраховка
-            min_cost15 = (cost_val*(1.0+CASH_MIN_MARGIN_PCT)) if (cost_val is not None) else None
-            fallback=None; reason_fb="P2_NONE_FALLBACK"
-            if cash_old is not None:
-                if min_cost15 is not None:
-                    fallback=floor1(max(cash_old, floor1(min_cost15)))
-                    reason_fb += " | USE_CASH_OLD_AND_ENSURE_MIN_1P5"
-                else:
-                    fallback=floor1(cash_old); reason_fb += " | USE_CASH_OLD"
-            elif cost_val is not None:
-                fallback=floor1(cost_val*(1.0+CASH_MIN_MARGIN_PCT)); reason_fb += " | USE_COST_PLUS_1P5"
-            cash_candidate=fallback; reason=f"{reason} | {reason_fb}" if reason else reason_fb
-
-        margin_abs = (cash_candidate - cost_val) if (cash_candidate is not None and cost_val is not None) else None
-        is_margin_ok = (margin_abs is not None and cost_val is not None and margin_abs >= cost_val*CASH_MIN_MARGIN_PCT) if margin_abs is not None else None
-        delta = (cash_candidate - cash_old) if (cash_candidate is not None and cash_old is not None) else None
-
-        results.append({
-            "Code": code, "Name": name, "Brand": brand,
-            "Stock": stock_val, "Virtual_Stock": virtual_stock_val,
-            "Cost": cost_val, "Cash_old": cash_old,
-            "Market_Count": len(prices_sorted),
-            "Market_Prices": "; ".join(map(lambda x: str(round_half_down_0_01(x)), prices_sorted)) if prices_sorted else None,                                                               
-            "Market_suppliers_used": "; ".join([f"{n}:{p}" for n,p in market_sorted_pairs]) if market_pairs else None,                                                                       
-            "Cash_new": cash_candidate, "Rank_num": rank,
-            "Target": "P2",  # явная цель
-            "MinMargin": floor1(cost_val*(1.0+CASH_MIN_MARGIN_PCT)) if cost_val is not None else None,                                                                                       
-            "RankFeasible": None,
-            "Margin_to_Cost": margin_abs, "Is_Margin_OK": is_margin_ok, "Delta": delta,
-            "Cost_col_idx": cost_col,
-            "Cost_src": cost_src,
-            "Cost_row_idx": cost_row_idx,
-            "Rule": "CASH_P2_TARGET", "Reason": reason
-        })
+                "Rule": "CASH_P2_TARGET",
+                "Reason": reason,
+            }
+        )
 
     out = pd.DataFrame(results)
 
     # Приведение типов
-    for c in ["Stock","Virtual_Stock","Cost","Cash_old","Cash_new","Rank_num","Margin_to_Cost",
-              "Delta","Market_Count","MinMargin"]:
+    for c in [
+        "Stock",
+        "Virtual_Stock",
+        "Cost",
+        "Cash_old",
+        "Cash_new",
+        "Rank_num",
+        "Margin_to_Cost",
+        "Delta",
+        "Market_Count",
+        "MinMargin",
+    ]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
 
     # «Рейтинг цены»: r из N
     def _fmt_rank(row):
-        rank = row.get("Rank_num"); cnt = row.get("Market_Count")
-        try: cnt_val = int(cnt) if pd.notna(cnt) else None
-        except: cnt_val = None
-        try: r_val = int(rank) if pd.notna(rank) else None
-        except: r_val = None
-        if cnt_val and cnt_val>0: return f"{r_val} из {cnt_val}" if r_val is not None else f"— из {cnt_val}"
+        rank = row.get("Rank_num")
+        cnt = row.get("Market_Count")
+        try:
+            cnt_val = int(cnt) if pd.notna(cnt) else None
+        except:
+            cnt_val = None
+        try:
+            r_val = int(rank) if pd.notna(rank) else None
+        except:
+            r_val = None
+        if cnt_val and cnt_val > 0:
+            return f"{r_val} из {cnt_val}" if r_val is not None else f"— из {cnt_val}"
         return None
+
     out["Рейтинг цены"] = out.apply(_fmt_rank, axis=1)
 
     # Min15 = floor1(Cost×1.015)
-    out["Min15"] = out["Cost"].apply(lambda c: floor1(c*(1.0+CASH_MIN_MARGIN_PCT)) if pd.notna(c) else None)
+    out["Min15"] = out["Cost"].apply(
+        lambda c: floor1(c * (1.0 + CASH_MIN_MARGIN_PCT)) if pd.notna(c) else None
+    )
     out["Min15"] = pd.to_numeric(out["Min15"], errors="coerce")
 
     # Удалить лишние колонки, если есть
-    out.drop(columns=[c for c in ["Min15","MinMargin"] if c in out.columns], inplace=True, errors="ignore")
+    out.drop(
+        columns=[c for c in ["Min15", "MinMargin"] if c in out.columns],
+        inplace=True,
+        errors="ignore",
+    )
 
     # Определить имя колонки с новым Cash
     cash_new_candidates = ["Cash_new", "New_Cash", "CashNew", "Cash"]
@@ -1374,28 +1947,50 @@ def analyze_cash_df(df: pd.DataFrame) -> pd.DataFrame:
         _cash_new_num = pd.to_numeric(out[cash_new_col], errors="coerce")
         _cost_num = pd.to_numeric(out["Cost"], errors="coerce")
         _pct = (_cash_new_num - _cost_num) / _cash_new_num * 100.0
-        out["Delta_Cost_to_CashNew_%"] = _pct.apply(lambda v: round_half_down_0_01(v) if pd.notna(v) else None)
-        out["Delta_Cost_to_CashNew_%"] = pd.to_numeric(out["Delta_Cost_to_CashNew_%"], errors="coerce")
+        out["Delta_Cost_to_CashNew_%"] = _pct.apply(
+            lambda v: round_half_down_0_01(v) if pd.notna(v) else None
+        )
+        out["Delta_Cost_to_CashNew_%"] = pd.to_numeric(
+            out["Delta_Cost_to_CashNew_%"], errors="coerce"
+        )
 
     # Удаляем Brand из вывода, если присутствует
     if "Brand" in out.columns:
         out.drop(columns=["Brand"], inplace=True)
 
     preferred = [
-        "Code","Name",
-        "Stock","Virtual_Stock",
-        "Cost","Cash_old","Cash_new","Delta","Delta_Cost_to_CashNew_%",
-        "Рейтинг цены","Margin_to_Cost","Market_suppliers_used",
-        "Target","Rule","Reason"
+        "Code",
+        "Name",
+        "Stock",
+        "Virtual_Stock",
+        "Cost",
+        "Cash_old",
+        "Cash_new",
+        "Delta",
+        "Delta_Cost_to_CashNew_%",
+        "Рейтинг цены",
+        "Margin_to_Cost",
+        "Market_suppliers_used",
+        "Target",
+        "Rule",
+        "Reason",
     ]
     preferred_present = [c for c in preferred if c in out.columns]
-    tail = [c for c in out.columns if c not in preferred_present + ["Market_Count","Rank_num"]]
+    tail = [
+        c
+        for c in out.columns
+        if c not in preferred_present + ["Market_Count", "Rank_num"]
+    ]
     out = out[preferred_present + tail]
     return out
 
+
 # ========= F17 анализ =========
 
-def choose_f17_price_p1(competitor_prices: List[float], cost_val: Optional[float], f17_old: Optional[float]) -> Tuple[Optional[float], str, Optional[int]]:
+
+def choose_f17_price_p1(
+    competitor_prices: List[float], cost_val: Optional[float], f17_old: Optional[float]
+) -> Tuple[Optional[float], str, Optional[int]]:
     """
     Динамический undercut (0.49 если p1..9, иначе 0.50), soft-cap на повышения,
     floor к 0.50, .99 только из целого, no-upmove против F17_old.
@@ -1429,102 +2024,119 @@ def choose_f17_price_p1(competitor_prices: List[float], cost_val: Optional[float
     rank = insertion_rank(base_sorted, cand)
     return cand, " | ".join(steps), rank
 
+
 def analyze_f17_df(df: pd.DataFrame) -> pd.DataFrame:
-    data = df.values.tolist()
-    y_base = detect_flag_base(data)
-    s_base = detect_strike_base(data)
-    if y_base is None or s_base is None:
-        raise ValueError("Не определены базовые сдвиги флагов (yellow/strike).")
-
-    # первая товарная строка
-    first_row = -1
-    for i in range(min(50, len(data))):
-        if is_intlike(data[i][1] if len(data[i])>1 else None):
-            first_row = i; break
-    if first_row == -1:
-        raise ValueError("Не найден первый товар в первых 50 строках.")
-
-    # найти столбец остатков по заголовку или по статистике шаблона
-    stock_col = find_col_by_tokens(data, first_row, y_base, STOCK_HEADER_TOKENS, fallback_1based=None)
-    if stock_col == -1:
-        # эвристика: выбираем колонку с макс. числом «остаточных» строк в окне строк
-        scan_top = min(len(data), first_row + 300)
-        best_j, best_cnt = -1, -1
-        for j in range(0, y_base):
-            header_text = _gather_headers_pairwise(data, first_row, j)
-            if _is_internal_header(header_text):
-                continue  # не считаем такие столбцы кандидатами для остатков
-            cnt = 0
-            for r in range(first_row, scan_top):
-                v = data[r][j] if len(data[r]) > j else None
-                if isinstance(v, str) and STOCK_PATTERN.match(v):
-                    cnt += 1
-            if cnt > best_cnt:
-                best_cnt, best_j = cnt, j
-        stock_col = best_j
+    data, y_base, s_base, first_row, stock_col = initialize_analysis_data(df)
 
     # список товаров
     product_rows: List[int] = []
     r = first_row
     while r < len(data):
-        if is_intlike(data[r][1] if len(data[r])>1 else None):
-            product_rows.append(r); r += 1
-            while r < len(data) and not is_intlike(data[r][1] if len(data[r])>1 else None):
+        if is_intlike(data[r][1] if len(data[r]) > 1 else None):
+            product_rows.append(r)
+            r += 1
+            while r < len(data) and not is_intlike(
+                data[r][1] if len(data[r]) > 1 else None
+            ):
                 r += 1
         else:
             r += 1
 
-    results=[]
+    results = []
     for pr in product_rows:
-        code = data[pr][2] if len(data[pr])>2 else None
+        code = data[pr][2] if len(data[pr]) > 2 else None
         name = extract_name_row(data, pr, 4)
 
-        # ----- Остаток (robust) -----
+        # ----- Остатки (с приоритетом stock_col) -----
         stock_val = virtual_stock_val = None
         stock_raw = None
 
-        total, virt, raw = read_stock_robust(data, pr, y_base, stock_col)
-        if total is not None:
-            stock_val = total
-            virtual_stock_val = virt
-            stock_raw = raw
+        # 3.1. Пытаемся прочитать ТОЛЬКО из stock_col (pr, pr+1, pr+2)
+        if stock_col is not None and stock_col >= 0:
+            for r_off in (0, 1, 2):
+                rr = pr + r_off
+                if rr >= len(data):
+                    break
+                val = data[rr][stock_col] if len(data[rr]) > stock_col else None
+                if isinstance(val, str) and STOCK_PATTERN.match(val):
+                    vvirt = parse_virtual_stock_value(val)
+                    if _virtual_ok(vvirt):
+                        stock_raw = val
+                        stock_val = parse_stock_value(val)
+                        virtual_stock_val = vvirt
+                        break
 
-        if stock_raw is not None and not _virtual_ok(virtual_stock_val):
-            # это была не колонка остатков → игнорируем
-            stock_raw = None
-            stock_val = None
-            virtual_stock_val = None
+        # 3.2. Если не нашли — ДОПУСКАЕМ широкий поиск, но только с проверкой виртуала
+        if stock_val is None:
+            best = None  # (segments, rr, jj, raw)
+            for r_off in (0, 1, 2):
+                rr = pr + r_off
+                if rr >= len(data):
+                    break
+                for jj in range(0, y_base):
+                    val = data[rr][jj] if len(data[rr]) > jj else None
+                    if isinstance(val, str) and STOCK_PATTERN.match(val):
+                        vvirt = parse_virtual_stock_value(val)
+                        if not _virtual_ok(vvirt):
+                            continue
+                        cand = (val.count("/"), rr, jj, val)
+                        if best is None or cand[0] > best[0]:
+                            best = cand
+            if best is not None:
+                _, rr, jj, raw = best
+                stock_raw = raw
+                stock_val = parse_stock_value(raw)
+                virtual_stock_val = parse_virtual_stock_value(raw)
 
         # COST/Cash/F17_old
         # VIP-логика выбора колонки Cost
         cost_col, _vip_col_dummy = find_cost_vip_cols(data, pr, y_base)
-        cash_col = find_col_by_tokens(data, pr, y_base, CASH_HEADER_TOKENS, fallback_1based=None)
-        f17_col = find_col_by_tokens(data, pr, y_base, F17_HEADER_TOKENS, fallback_1based=None)
+        cash_col = find_col_by_tokens(
+            data, pr, y_base, CASH_HEADER_TOKENS, fallback_1based=None
+        )
+        f17_col = find_col_by_tokens(
+            data, pr, y_base, F17_HEADER_TOKENS, fallback_1based=None
+        )
 
         cost_val = None
-        if pr + 1 < len(data) and cost_col is not None and cost_col >= 0 and len(data[pr + 1]) > cost_col:
+        if (
+            pr + 1 < len(data)
+            and cost_col is not None
+            and cost_col >= 0
+            and len(data[pr + 1]) > cost_col
+        ):
             c = parse_float(data[pr + 1][cost_col])
             if c is not None and c > 0:
                 is_y = flag_at(data, pr + 1, cost_col, y_base)  # жёлтая обязательна
                 if is_y:
                     cost_val = float(c)
 
-        cash_old=None
-        if cash_col is not None and cash_col>=0 and pr+1 < len(data) and len(data[pr+1])>cash_col:
-            v = parse_float(data[pr+1][cash_col])
-            is_y = flag_at(data, pr+1, cash_col, y_base)
-            is_s = flag_at(data, pr+1, cash_col, s_base)
-            if v is not None and v>0 and is_y and not is_s:
+        cash_old = None
+        if (
+            cash_col is not None
+            and cash_col >= 0
+            and pr + 1 < len(data)
+            and len(data[pr + 1]) > cash_col
+        ):
+            v = parse_float(data[pr + 1][cash_col])
+            is_y = flag_at(data, pr + 1, cash_col, y_base)
+            is_s = flag_at(data, pr + 1, cash_col, s_base)
+            if v is not None and v > 0 and is_y and not is_s:
                 cash_old = float(v)
             else:
                 cash_old = None
 
         # F17_old: брать ТОЛЬКО если клетка жёлтая и НЕ зачёркнута
         f17_old = None
-        if pr + 1 < len(data) and f17_col is not None and f17_col >= 0 and len(data[pr + 1]) > f17_col:
+        if (
+            pr + 1 < len(data)
+            and f17_col is not None
+            and f17_col >= 0
+            and len(data[pr + 1]) > f17_col
+        ):
             v = parse_float(data[pr + 1][f17_col])
-            is_y = flag_at(data, pr + 1, f17_col, y_base)   # жёлтая
-            is_s = flag_at(data, pr + 1, f17_col, s_base)   # зачёркнута
+            is_y = flag_at(data, pr + 1, f17_col, y_base)  # жёлтая
+            is_s = flag_at(data, pr + 1, f17_col, s_base)  # зачёркнута
             if v is not None and v > 0 and is_y and not is_s:
                 f17_old = float(v)
             else:
@@ -1538,46 +2150,102 @@ def analyze_f17_df(df: pd.DataFrame) -> pd.DataFrame:
 
         # Stock==0 → не ставим цену
         if stock_val == 0:
-            f17_old_raw = parse_float(data[pr + 1][f17_col]) if (f17_col is not None and pr + 1 < len(data) and len(data[pr + 1]) > f17_col) else None
-            f17_old_flag = ("OK" if (f17_old is not None) else "SKIPPED")
-            results.append({
-                "Code": code, "Name": name,
-                "Stock": stock_val, "Virtual_Stock": virtual_stock_val,
-                "Cost": cost_val, "Cash": cash_old, "F17_old": f17_old,
-                "F17_old_raw": f17_old_raw, "F17_old_flag": f17_old_flag,
-                "Market_Count": len(prices_sorted),
-                "Market_Prices": "; ".join(map(lambda x: str(round_half_down_0_01(x)), prices_sorted)) if prices_sorted else None,
-                "Market_suppliers_used": "; ".join([f"{n}:{p}" for n, p in market_sorted_pairs]) if market_pairs else None,
-                "F17_new": None, "Rank_num": None,
-                "Rule": "STOCK_EQ_0_SKIP", "Reason": "STOCK_EQ_0"
-            })
+            f17_old_raw = (
+                parse_float(data[pr + 1][f17_col])
+                if (
+                    f17_col is not None
+                    and pr + 1 < len(data)
+                    and len(data[pr + 1]) > f17_col
+                )
+                else None
+            )
+            f17_old_flag = "OK" if (f17_old is not None) else "SKIPPED"
+            results.append(
+                {
+                    "Code": code,
+                    "Name": name,
+                    "Stock": stock_val,
+                    "Virtual_Stock": virtual_stock_val,
+                    "Cost": cost_val,
+                    "Cash": cash_old,
+                    "F17_old": f17_old,
+                    "F17_old_raw": f17_old_raw,
+                    "F17_old_flag": f17_old_flag,
+                    "Market_Count": len(prices_sorted),
+                    "Market_Prices": (
+                        "; ".join(
+                            map(lambda x: str(round_half_down_0_01(x)), prices_sorted)
+                        )
+                        if prices_sorted
+                        else None
+                    ),
+                    "Market_suppliers_used": (
+                        "; ".join([f"{n}:{p}" for n, p in market_sorted_pairs])
+                        if market_pairs
+                        else None
+                    ),
+                    "F17_new": None,
+                    "Rank_num": None,
+                    "Rule": "STOCK_EQ_0_SKIP",
+                    "Reason": "STOCK_EQ_0",
+                }
+            )
             continue
 
         # Нет рынка → держим F17_old (если валиден)
         if len(prices_sorted) == 0:
-            f17_old_raw = parse_float(data[pr + 1][f17_col]) if (f17_col is not None and pr + 1 < len(data) and len(data[pr + 1]) > f17_col) else None
-            f17_old_flag = ("OK" if (f17_old is not None) else "SKIPPED")
+            f17_old_raw = (
+                parse_float(data[pr + 1][f17_col])
+                if (
+                    f17_col is not None
+                    and pr + 1 < len(data)
+                    and len(data[pr + 1]) > f17_col
+                )
+                else None
+            )
+            f17_old_flag = "OK" if (f17_old is not None) else "SKIPPED"
             if f17_old is not None:
-                results.append({
-                    "Code": code, "Name": name,
-                    "Stock": stock_val, "Virtual_Stock": virtual_stock_val,
-                    "Cost": cost_val, "Cash": cash_old, "F17_old": f17_old,
-                    "F17_old_raw": f17_old_raw, "F17_old_flag": f17_old_flag,
-                    "Market_Count": 0, "Market_Prices": None, "Market_suppliers_used": None,
-                    "F17_new": f17_old, "Rank_num": None,
-                    "Rule": "NO_MARKET_USE_F17_OLD",
-                    "Reason": "NO_MARKET | USE_F17_OLD (valid yellow & not strike)"
-                })
+                results.append(
+                    {
+                        "Code": code,
+                        "Name": name,
+                        "Stock": stock_val,
+                        "Virtual_Stock": virtual_stock_val,
+                        "Cost": cost_val,
+                        "Cash": cash_old,
+                        "F17_old": f17_old,
+                        "F17_old_raw": f17_old_raw,
+                        "F17_old_flag": f17_old_flag,
+                        "Market_Count": 0,
+                        "Market_Prices": None,
+                        "Market_suppliers_used": None,
+                        "F17_new": f17_old,
+                        "Rank_num": None,
+                        "Rule": "NO_MARKET_USE_F17_OLD",
+                        "Reason": "NO_MARKET | USE_F17_OLD (valid yellow & not strike)",
+                    }
+                )
             else:
-                results.append({
-                    "Code": code, "Name": name,
-                    "Stock": stock_val, "Virtual_Stock": virtual_stock_val,
-                    "Cost": cost_val, "Cash": cash_old, "F17_old": f17_old,
-                    "F17_old_raw": f17_old_raw, "F17_old_flag": f17_old_flag,
-                    "Market_Count": 0, "Market_Prices": None, "Market_suppliers_used": None,
-                    "F17_new": None, "Rank_num": None,
-                    "Rule": "NO_MARKET", "Reason": "NO_MARKET | NO_VALID_F17_OLD"
-                })
+                results.append(
+                    {
+                        "Code": code,
+                        "Name": name,
+                        "Stock": stock_val,
+                        "Virtual_Stock": virtual_stock_val,
+                        "Cost": cost_val,
+                        "Cash": cash_old,
+                        "F17_old": f17_old,
+                        "F17_old_raw": f17_old_raw,
+                        "F17_old_flag": f17_old_flag,
+                        "Market_Count": 0,
+                        "Market_Prices": None,
+                        "Market_suppliers_used": None,
+                        "F17_new": None,
+                        "Rank_num": None,
+                        "Rule": "NO_MARKET",
+                        "Reason": "NO_MARKET | NO_VALID_F17_OLD",
+                    }
+                )
             continue
 
         # Чистка анти-выбросов и p1
@@ -1591,7 +2259,12 @@ def analyze_f17_df(df: pd.DataFrame) -> pd.DataFrame:
         reason = None
         ALLOW_UPMOVE = False
 
-        if (GAP_TIGHTEN_ENABLED and f17_old is not None and cost_val is not None and p1_local is not None):
+        if (
+            GAP_TIGHTEN_ENABLED
+            and f17_old is not None
+            and cost_val is not None
+            and p1_local is not None
+        ):
             gap = p1_local - f17_old  # насколько мы ниже рынка
             if gap >= GAP_TIGHTEN_TRIGGER:
                 target_max = p1_local - step_eff
@@ -1620,7 +2293,10 @@ def analyze_f17_df(df: pd.DataFrame) -> pd.DataFrame:
                                 cand = apply_ending_99_if_integer(cand)
 
                             # держим ≤ p1 - step (страховка)
-                            if p1_local is not None and cand > (p1_local - step_eff) + 1e-9:
+                            if (
+                                p1_local is not None
+                                and cand > (p1_local - step_eff) + 1e-9
+                            ):
                                 cand = p1_local - step_eff
                                 if ROUND_TO_HALF:
                                     cand = round_to_0_50(cand)
@@ -1631,7 +2307,11 @@ def analyze_f17_df(df: pd.DataFrame) -> pd.DataFrame:
                         if cand < min_allowed - 1e-9:
                             cand = min_allowed
 
-                    f17_candidate = float(Decimal(str(cand)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+                    f17_candidate = float(
+                        Decimal(str(cand)).quantize(
+                            Decimal("0.01"), rounding=ROUND_HALF_UP
+                        )
+                    )
                     rule_val = "TIGHTEN_GAP_UPMOVE"
                     reason = f"OLD_IS_#1 | GAP={gap:.2f}≥{GAP_TIGHTEN_TRIGGER} | SET_TO_P1_MINUS_{step_eff:.2f}"
                     ALLOW_UPMOVE = True  # разрешаем повышение в этом кейсе
@@ -1641,7 +2321,10 @@ def analyze_f17_df(df: pd.DataFrame) -> pd.DataFrame:
             # если старая уже #1 и не ниже мин.порога — держим старую
             keep_old = False
             if f17_old is not None and p1_local is not None:
-                if (p1_local - f17_old) >= 0.01 and (cost_val is None or (f17_old - cost_val) >= GRANDFATHER_MIN_MARGIN - 1e-9):
+                if (p1_local - f17_old) >= 0.01 and (
+                    cost_val is None
+                    or (f17_old - cost_val) >= GRANDFATHER_MIN_MARGIN - 1e-9
+                ):
                     keep_old = True
 
             if keep_old:
@@ -1651,7 +2334,9 @@ def analyze_f17_df(df: pd.DataFrame) -> pd.DataFrame:
                 rank = insertion_rank(sorted(prices_sorted), f17_candidate)
             else:
                 # Новый кандидат под p1
-                f17_candidate, reason, rank = choose_f17_price_p1(prices_sorted, cost_val, f17_old)
+                f17_candidate, reason, rank = choose_f17_price_p1(
+                    prices_sorted, cost_val, f17_old
+                )
                 rule_val = "F17_FROM_P1"
 
                 # CAP по Cash (не дороже Cash), при этом не нарушаем минимум Cost+0.50 и #1
@@ -1661,144 +2346,199 @@ def analyze_f17_df(df: pd.DataFrame) -> pd.DataFrame:
                         if f17_candidate > cash_old:
                             f17_candidate = cash_old
                             if ROUND_ENDING_99:
-                                f17_candidate = apply_ending_99_if_integer(f17_candidate)
+                                f17_candidate = apply_ending_99_if_integer(
+                                    f17_candidate
+                                )
                             # сохраняем #1
-                            if p1_local is not None and f17_candidate > (p1_local - step_eff) + 1e-9:
+                            if (
+                                p1_local is not None
+                                and f17_candidate > (p1_local - step_eff) + 1e-9
+                            ):
                                 f17_candidate = p1_local - step_eff
                                 if ROUND_TO_HALF:
                                     f17_candidate = round_to_0_50(f17_candidate)
                                 if ROUND_ENDING_99:
-                                    f17_candidate = apply_ending_99_if_integer(f17_candidate)
+                                    f17_candidate = apply_ending_99_if_integer(
+                                        f17_candidate
+                                    )
 
                 # Если решения нет — проверяем infeasible по минимуму
-                if f17_candidate is None and p1_local is not None and cost_val is not None:
+                if (
+                    f17_candidate is None
+                    and p1_local is not None
+                    and cost_val is not None
+                ):
                     min_allowed = cost_val + 0.50
-                    infeasible_by_market = (min_allowed > (p1_local - step_eff) + 1e-9)
+                    infeasible_by_market = min_allowed > (p1_local - step_eff) + 1e-9
                     if infeasible_by_market and SKIP_OLD_WHEN_MARKET_INFEASIBLE:
                         # рынок слишком низкий → ничего не ставим (и НЕ откатываемся)
                         rule_val = "SKIP_INFEASIBLE_MARKET_TOO_LOW"
-                        reason = (reason + " | P1_INFEASIBLE_MIN_ABS") if reason else "P1_INFEASIBLE_MIN_ABS"
+                        reason = (
+                            (reason + " | P1_INFEASIBLE_MIN_ABS")
+                            if reason
+                            else "P1_INFEASIBLE_MIN_ABS"
+                        )
                     elif f17_old is not None and p1_local is not None:
                         # если не infeasible — оставим старую при условии #1 и порогов
-                        if (f17_old <= (p1_local - step_eff) + 1e-9 and
-                            (f17_old >= cost_val + 0.50 - 1e-9) and
-                            (f17_old <= cost_val + 3.00 + 1e-9)):
+                        if (
+                            f17_old <= (p1_local - step_eff) + 1e-9
+                            and (f17_old >= cost_val + 0.50 - 1e-9)
+                            and (f17_old <= cost_val + 3.00 + 1e-9)
+                        ):
                             f17_candidate = f17_old
                             rule_val = "KEEP_OLD_STABLE"
-                            reason = (reason + " | OLD_STILL_#1") if reason else "OLD_STILL_#1"
+                            reason = (
+                                (reason + " | OLD_STILL_#1")
+                                if reason
+                                else "OLD_STILL_#1"
+                            )
 
         # Глобальный запрет повышений (кроме явной подтяжки)
-        if (f17_candidate is not None and f17_old is not None and
-            f17_candidate > f17_old + 1e-9 and not ALLOW_UPMOVE):
+        if (
+            f17_candidate is not None
+            and f17_old is not None
+            and f17_candidate > f17_old + 1e-9
+            and not ALLOW_UPMOVE
+        ):
             f17_candidate = f17_old
             rule_val = "NO_UPMOVE_KEEP_OLD"
             reason = (reason + " | NO_UPMOVE") if reason else "NO_UPMOVE"
 
-        margin_abs = (f17_candidate - cost_val) if (f17_candidate is not None and cost_val is not None) else None
-        margin_pct = round((margin_abs / cost_val * 100.0), 2) if (margin_abs is not None and cost_val not in (None, 0)) else None
-        delta = (f17_candidate - f17_old) if (f17_candidate is not None and f17_old is not None) else None
+        margin_abs = (
+            (f17_candidate - cost_val)
+            if (f17_candidate is not None and cost_val is not None)
+            else None
+        )
+        margin_pct = (
+            round((margin_abs / cost_val * 100.0), 2)
+            if (margin_abs is not None and cost_val not in (None, 0))
+            else None
+        )
+        delta = (
+            (f17_candidate - f17_old)
+            if (f17_candidate is not None and f17_old is not None)
+            else None
+        )
 
-        f17_old_raw = parse_float(data[pr + 1][f17_col]) if (f17_col is not None and pr + 1 < len(data) and len(data[pr + 1]) > f17_col) else None
-        f17_old_flag = ("OK" if (f17_old is not None) else "SKIPPED")
+        f17_old_raw = (
+            parse_float(data[pr + 1][f17_col])
+            if (
+                f17_col is not None
+                and pr + 1 < len(data)
+                and len(data[pr + 1]) > f17_col
+            )
+            else None
+        )
+        f17_old_flag = "OK" if (f17_old is not None) else "SKIPPED"
 
-        results.append({
-            "Code": code, "Name": name,
-            "Stock": stock_val, "Virtual_Stock": virtual_stock_val,
-            "Cost": cost_val, "Cash": cash_old, "F17_old": f17_old,
-            "F17_old_raw": f17_old_raw, "F17_old_flag": f17_old_flag,
-            "Market_Count": len(prices_sorted),
-            "Market_Prices": "; ".join(map(lambda x: str(round_half_down_0_01(x)), prices_sorted)) if prices_sorted else None,
-            "Market_suppliers_used": "; ".join([f"{n}:{p}" for n, p in market_sorted_pairs]) if market_pairs else None,
-            "F17_new": f17_candidate, "Rank_num": rank if 'rank' in locals() else None,
-            "Margin_to_Cost": margin_abs, "Margin_to_Cost_%": margin_pct, "Delta_F17": delta,
-            "Rule": rule_val, "Reason": reason
-        })
+        results.append(
+            {
+                "Code": code,
+                "Name": name,
+                "Stock": stock_val,
+                "Virtual_Stock": virtual_stock_val,
+                "Cost": cost_val,
+                "Cash": cash_old,
+                "F17_old": f17_old,
+                "F17_old_raw": f17_old_raw,
+                "F17_old_flag": f17_old_flag,
+                "Market_Count": len(prices_sorted),
+                "Market_Prices": (
+                    "; ".join(
+                        map(lambda x: str(round_half_down_0_01(x)), prices_sorted)
+                    )
+                    if prices_sorted
+                    else None
+                ),
+                "Market_suppliers_used": (
+                    "; ".join([f"{n}:{p}" for n, p in market_sorted_pairs])
+                    if market_pairs
+                    else None
+                ),
+                "F17_new": f17_candidate,
+                "Rank_num": rank if "rank" in locals() else None,
+                "Margin_to_Cost": margin_abs,
+                "Margin_to_Cost_%": margin_pct,
+                "Delta_F17": delta,
+                "Rule": rule_val,
+                "Reason": reason,
+            }
+        )
 
     out = pd.DataFrame(results)
 
     # Приведение типов
-    for c in ["Stock","Virtual_Stock","Cost","Cash","F17_old","F17_new","Rank_num","Margin_to_Cost","Margin_to_Cost_%","Delta_F17","Market_Count"]:
+    for c in [
+        "Stock",
+        "Virtual_Stock",
+        "Cost",
+        "Cash",
+        "F17_old",
+        "F17_new",
+        "Rank_num",
+        "Margin_to_Cost",
+        "Margin_to_Cost_%",
+        "Delta_F17",
+        "Market_Count",
+    ]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
-    
+
     # Форматирование Delta_F17 как в cash анализе (с round_half_down_0_01)
     if "Delta_F17" in out.columns:
-        out["Delta_F17"] = out["Delta_F17"].apply(lambda x: round_half_down_0_01(x) if pd.notna(x) else None)
+        out["Delta_F17"] = out["Delta_F17"].apply(
+            lambda x: round_half_down_0_01(x) if pd.notna(x) else None
+        )
 
     # «Рейтинг цены»: r из N
     def _fmt_rank(row):
-        rank = row.get("Rank_num"); cnt = row.get("Market_Count")
-        try: cnt_val = int(cnt) if pd.notna(cnt) else None
-        except: cnt_val = None
-        try: r_val = int(rank) if pd.notna(rank) else None
-        except: r_val = None
-        if cnt_val and cnt_val>0: return f"{r_val} из {cnt_val}" if r_val is not None else f"— из {cnt_val}"
+        rank = row.get("Rank_num")
+        cnt = row.get("Market_Count")
+        try:
+            cnt_val = int(cnt) if pd.notna(cnt) else None
+        except:
+            cnt_val = None
+        try:
+            r_val = int(rank) if pd.notna(rank) else None
+        except:
+            r_val = None
+        if cnt_val and cnt_val > 0:
+            return f"{r_val} из {cnt_val}" if r_val is not None else f"— из {cnt_val}"
         return None
+
     out["Рейтинг цены"] = out.apply(_fmt_rank, axis=1)
 
     preferred = [
-        "Code","Name",
-        "Stock","Virtual_Stock",
-        "Cost","Cash","F17_old","F17_new","Delta_F17","Margin_to_Cost_%",
-        "Рейтинг цены","Market_suppliers_used",
-        "Rule","Reason"
+        "Code",
+        "Name",
+        "Stock",
+        "Virtual_Stock",
+        "Cost",
+        "Cash",
+        "F17_old",
+        "F17_new",
+        "Delta_F17",
+        "Margin_to_Cost_%",
+        "Рейтинг цены",
+        "Market_suppliers_used",
+        "Rule",
+        "Reason",
     ]
     preferred_present = [c for c in preferred if c in out.columns]
-    tail = [c for c in out.columns if c not in preferred_present + ["Market_Count","Rank_num","Margin_to_Cost"]]
+    tail = [
+        c
+        for c in out.columns
+        if c not in preferred_present + ["Market_Count", "Rank_num", "Margin_to_Cost"]
+    ]
     out = out[preferred_present + tail]
     return out
 
-# ========= Zakup Analysis =========
 
-def pick_zakup_from_sorted_prices(sorted_prices: List[float]) -> Tuple[Optional[float], str]:
-    n = len(sorted_prices)
-    if n == 0:
-        return None, "NO_MARKET"
-    if n >= 5:
-        return sorted_prices[2], "N5PLUS_TAKE_3RD"
-    if n == 4:
-        return sorted_prices[2], "N4_TAKE_3RD"
-    if n == 3:
-        return sorted_prices[1], "N3_TAKE_MEDIAN"
-    if n == 2:
-        return sorted_prices[1], "N2_TAKE_2ND"
-    return sorted_prices[0], "N1_ONLY_PRICE_USED"
+# ========= Zakup Analysis =========
 
 
 def analyze_zakup_df(df: pd.DataFrame) -> pd.DataFrame:
-    data = df.values.tolist()
-    y_base = detect_flag_base(data)
-    s_base = detect_strike_base(data)
-    if y_base is None or s_base is None:
-        raise ValueError("Не определены базовые сдвиги флагов (yellow/strike).")
-
-    # первая товарная строка
-    first_row = -1
-    for i in range(min(50, len(data))):
-        if is_intlike(data[i][1] if len(data[i]) > 1 else None):
-            first_row = i
-            break
-    if first_row == -1:
-        raise ValueError("Не найден первый товар в первых 50 строках.")
-
-    # найти столбец остатков по заголовку или по статистике шаблона
-    stock_col = find_col_by_tokens(data, first_row, y_base, STOCK_HEADER_TOKENS, fallback_1based=None)
-    if stock_col == -1:
-        # эвристика: колонка с максимумом строк в формате "остатков"
-        scan_top = min(len(data), first_row + 300)
-        best_j, best_cnt = -1, -1
-        for j in range(0, y_base):
-            header_text = _gather_headers_pairwise(data, first_row, j)
-            if _is_internal_header(header_text):
-                continue  # не считаем такие столбцы кандидатами для остатков
-            cnt = 0
-            for r in range(first_row, scan_top):
-                v = data[r][j] if len(data[r]) > j else None
-                if isinstance(v, str) and STOCK_PATTERN.match(v):
-                    cnt += 1
-            if cnt > best_cnt:
-                best_cnt, best_j = cnt, j
-        stock_col = best_j
+    data, y_base, s_base, first_row, stock_col = initialize_analysis_data(df)
 
     # список товаров
     product_rows: List[int] = []
@@ -1807,7 +2547,9 @@ def analyze_zakup_df(df: pd.DataFrame) -> pd.DataFrame:
         if is_intlike(data[r][1] if len(data[r]) > 1 else None):
             product_rows.append(r)
             r += 1
-            while r < len(data) and not is_intlike(data[r][1] if len(data[r]) > 1 else None):
+            while r < len(data) and not is_intlike(
+                data[r][1] if len(data[r]) > 1 else None
+            ):
                 r += 1
         else:
             r += 1
@@ -1817,30 +2559,62 @@ def analyze_zakup_df(df: pd.DataFrame) -> pd.DataFrame:
         code = data[pr][2] if len(data[pr]) > 2 else None
         name = extract_name_row(data, pr, 4)
 
-        # ----- Остаток (robust) -----
+        # ----- Остатки (с приоритетом stock_col) -----
         stock_val = virtual_stock_val = None
         stock_raw = None
 
-        total, virt, raw = read_stock_robust(data, pr, y_base, stock_col)
-        if total is not None:
-            stock_val = total
-            virtual_stock_val = virt
-            stock_raw = raw
+        # 3.1. Пытаемся прочитать ТОЛЬКО из stock_col (pr, pr+1, pr+2)
+        if stock_col is not None and stock_col >= 0:
+            for r_off in (0, 1, 2):
+                rr = pr + r_off
+                if rr >= len(data):
+                    break
+                val = data[rr][stock_col] if len(data[rr]) > stock_col else None
+                if isinstance(val, str) and STOCK_PATTERN.match(val):
+                    vvirt = parse_virtual_stock_value(val)
+                    if _virtual_ok(vvirt):
+                        stock_raw = val
+                        stock_val = parse_stock_value(val)
+                        virtual_stock_val = vvirt
+                        break
 
-        if stock_raw is not None and not _virtual_ok(virtual_stock_val):
-            # это была не колонка остатков → игнорируем
-            stock_raw = None
-            stock_val = None
-            virtual_stock_val = None
+        # 3.2. Если не нашли — ДОПУСКАЕМ широкий поиск, но только с проверкой виртуала
+        if stock_val is None:
+            best = None  # (segments, rr, jj, raw)
+            for r_off in (0, 1, 2):
+                rr = pr + r_off
+                if rr >= len(data):
+                    break
+                for jj in range(0, y_base):
+                    val = data[rr][jj] if len(data[rr]) > jj else None
+                    if isinstance(val, str) and STOCK_PATTERN.match(val):
+                        vvirt = parse_virtual_stock_value(val)
+                        if not _virtual_ok(vvirt):
+                            continue
+                        cand = (val.count("/"), rr, jj, val)
+                        if best is None or cand[0] > best[0]:
+                            best = cand
+            if best is not None:
+                _, rr, jj, raw = best
+                stock_raw = raw
+                stock_val = parse_stock_value(raw)
+                virtual_stock_val = parse_virtual_stock_value(raw)
 
         # колонки cost / zakup_old
         # VIP-логика выбора колонки Cost
         cost_col, _vip_col_dummy = find_cost_vip_cols(data, pr, y_base)
-        zakup_col = find_col_by_tokens(data, pr, y_base, ZAKUP_HEADER_TOKENS, fallback_1based=None)
+        zakup_col = find_col_by_tokens(
+            data, pr, y_base, ZAKUP_HEADER_TOKENS, fallback_1based=None
+        )
 
         # COST (VIP-правило): жёлтая ячейка, strike не проверяем
         cost_val = None
-        if pr + 1 < len(data) and cost_col is not None and cost_col >= 0 and len(data[pr + 1]) > cost_col:
+        if (
+            pr + 1 < len(data)
+            and cost_col is not None
+            and cost_col >= 0
+            and len(data[pr + 1]) > cost_col
+        ):
             c = parse_float(data[pr + 1][cost_col])
             if c is not None and c > 0:
                 is_y = flag_at(data, pr + 1, cost_col, y_base)
@@ -1849,7 +2623,12 @@ def analyze_zakup_df(df: pd.DataFrame) -> pd.DataFrame:
 
         # Zakup_old (берём как число, без флаговой жёсткости)
         zakup_old = None
-        if zakup_col is not None and zakup_col >= 0 and pr + 1 < len(data) and len(data[pr + 1]) > zakup_col:
+        if (
+            zakup_col is not None
+            and zakup_col >= 0
+            and pr + 1 < len(data)
+            and len(data[pr + 1]) > zakup_col
+        ):
             z = parse_float(data[pr + 1][zakup_col])
             zakup_old = float(z) if (z is not None and z > 0) else None
 
@@ -1863,59 +2642,156 @@ def analyze_zakup_df(df: pd.DataFrame) -> pd.DataFrame:
         if (stock_val is not None and stock_val == 0) and (virtual_stock_val == 35):
             if zakup_old is not None:
                 zakup_new = floor1(zakup_old)
-                delta = round(zakup_new - zakup_old, 2) if zakup_new is not None else None
+                delta = (
+                    round(zakup_new - zakup_old, 2) if zakup_new is not None else None
+                )
                 change = "Y" if (delta is not None and abs(delta) >= 0.01) else "N"
-                results.append({
-                    "Code": code, "Name": name, "Stock": stock_val, "Virtual_Stock": virtual_stock_val,
-                    "Cost": cost_val, "Zakup_old": zakup_old,
-                    "Market_Count": len(market_prices_sorted),
-                    "Market_Prices": "; ".join(map(lambda x: str(round_half_down_0_01(x)), market_prices_sorted)) if market_prices_sorted else None,
-                    "Market_suppliers_used": "; ".join([f"{n}:{p}" for n, p in market_sorted_pairs]) if market_pairs else None,
-                    "Market_Selected": None, "Chosen_Index": None,
-                    "Zakup_new": zakup_new, "Delta": delta, "Change": change,
-                    "Rule": "STOCK0_VS35_USE_OLD", "Reason": "STOCK0_VS35_HAS_OLD", "Stock_raw": stock_raw,
-                })
+                results.append(
+                    {
+                        "Code": code,
+                        "Name": name,
+                        "Stock": stock_val,
+                        "Virtual_Stock": virtual_stock_val,
+                        "Cost": cost_val,
+                        "Zakup_old": zakup_old,
+                        "Market_Count": len(market_prices_sorted),
+                        "Market_Prices": (
+                            "; ".join(
+                                map(
+                                    lambda x: str(round_half_down_0_01(x)),
+                                    market_prices_sorted,
+                                )
+                            )
+                            if market_prices_sorted
+                            else None
+                        ),
+                        "Market_suppliers_used": (
+                            "; ".join([f"{n}:{p}" for n, p in market_sorted_pairs])
+                            if market_pairs
+                            else None
+                        ),
+                        "Market_Selected": None,
+                        "Chosen_Index": None,
+                        "Zakup_new": zakup_new,
+                        "Delta": delta,
+                        "Change": change,
+                        "Rule": "STOCK0_VS35_USE_OLD",
+                        "Reason": "STOCK0_VS35_HAS_OLD",
+                        "Stock_raw": stock_raw,
+                    }
+                )
             else:
-                results.append({
-                    "Code": code, "Name": name, "Stock": stock_val, "Virtual_Stock": virtual_stock_val,
-                    "Cost": cost_val, "Zakup_old": zakup_old,
-                    "Market_Count": len(market_prices_sorted),
-                    "Market_Prices": "; ".join(map(lambda x: str(round_half_down_0_01(x)), market_prices_sorted)) if market_prices_sorted else None,
-                    "Market_suppliers_used": "; ".join([f"{n}:{p}" for n, p in market_sorted_pairs]) if market_pairs else None,
-                    "Market_Selected": None, "Chosen_Index": None,
-                    "Zakup_new": None, "Delta": None, "Change": "N",
-                    "Rule": "STOCK0_VS35_SKIP_NO_OLD", "Reason": "NO_MARKS_STOCK0_VS35_NO_OLD", "Stock_raw": stock_raw,
-                })
+                results.append(
+                    {
+                        "Code": code,
+                        "Name": name,
+                        "Stock": stock_val,
+                        "Virtual_Stock": virtual_stock_val,
+                        "Cost": cost_val,
+                        "Zakup_old": zakup_old,
+                        "Market_Count": len(market_prices_sorted),
+                        "Market_Prices": (
+                            "; ".join(
+                                map(
+                                    lambda x: str(round_half_down_0_01(x)),
+                                    market_prices_sorted,
+                                )
+                            )
+                            if market_prices_sorted
+                            else None
+                        ),
+                        "Market_suppliers_used": (
+                            "; ".join([f"{n}:{p}" for n, p in market_sorted_pairs])
+                            if market_pairs
+                            else None
+                        ),
+                        "Market_Selected": None,
+                        "Chosen_Index": None,
+                        "Zakup_new": None,
+                        "Delta": None,
+                        "Change": "N",
+                        "Rule": "STOCK0_VS35_SKIP_NO_OLD",
+                        "Reason": "NO_MARKS_STOCK0_VS35_NO_OLD",
+                        "Stock_raw": stock_raw,
+                    }
+                )
             continue
 
         # Stock=0 & VS=0 → пропуск
         if (stock_val is not None and stock_val == 0) and (virtual_stock_val == 0):
-            results.append({
-                "Code": code, "Name": name, "Stock": stock_val, "Virtual_Stock": virtual_stock_val,
-                "Cost": cost_val, "Zakup_old": zakup_old,
-                "Market_Count": len(market_prices_sorted),
-                "Market_Prices": "; ".join(map(lambda x: str(round_half_down_0_01(x)), market_prices_sorted)) if market_prices_sorted else None,
-                "Market_suppliers_used": "; ".join([f"{n}:{p}" for n, p in market_sorted_pairs]) if market_pairs else None,
-                "Market_Selected": None, "Chosen_Index": None,
-                "Zakup_new": None, "Delta": None, "Change": "N",
-                "Rule": "STOCK0_VS0_SKIP", "Reason": "NO_MARKS_STOCK0_VS0", "Stock_raw": stock_raw,
-            })
+            results.append(
+                {
+                    "Code": code,
+                    "Name": name,
+                    "Stock": stock_val,
+                    "Virtual_Stock": virtual_stock_val,
+                    "Cost": cost_val,
+                    "Zakup_old": zakup_old,
+                    "Market_Count": len(market_prices_sorted),
+                    "Market_Prices": (
+                        "; ".join(
+                            map(
+                                lambda x: str(round_half_down_0_01(x)),
+                                market_prices_sorted,
+                            )
+                        )
+                        if market_prices_sorted
+                        else None
+                    ),
+                    "Market_suppliers_used": (
+                        "; ".join([f"{n}:{p}" for n, p in market_sorted_pairs])
+                        if market_pairs
+                        else None
+                    ),
+                    "Market_Selected": None,
+                    "Chosen_Index": None,
+                    "Zakup_new": None,
+                    "Delta": None,
+                    "Change": "N",
+                    "Rule": "STOCK0_VS0_SKIP",
+                    "Reason": "NO_MARKS_STOCK0_VS0",
+                    "Stock_raw": stock_raw,
+                }
+            )
             continue
 
         # Stock>0 и рынка нет → Zakup_old
         if (stock_val is not None and stock_val > 0) and len(market_prices_sorted) == 0:
             zakup_new = floor1(zakup_old) if zakup_old is not None else None
-            delta = round(zakup_new - zakup_old, 2) if (zakup_new is not None and zakup_old is not None) else None
-            change = "Y" if ((delta is not None and abs(delta) >= 0.01) or (zakup_new is not None and zakup_old is None)) else "N"
-            results.append({
-                "Code": code, "Name": name, "Stock": stock_val, "Virtual_Stock": virtual_stock_val,
-                "Cost": cost_val, "Zakup_old": zakup_old,
-                "Market_Count": 0, "Market_Prices": None, "Market_suppliers_used": None,
-                "Market_Selected": None, "Chosen_Index": None,
-                "Zakup_new": zakup_new, "Delta": delta, "Change": change,
-                "Rule": "STOCK_GT0_NO_MARKET_USE_OLD", "Reason": "STOCK_GT0_PRICE_MUST_EXIST",
-                "Stock_raw": stock_raw,
-            })
+            delta = (
+                round(zakup_new - zakup_old, 2)
+                if (zakup_new is not None and zakup_old is not None)
+                else None
+            )
+            change = (
+                "Y"
+                if (
+                    (delta is not None and abs(delta) >= 0.01)
+                    or (zakup_new is not None and zakup_old is None)
+                )
+                else "N"
+            )
+            results.append(
+                {
+                    "Code": code,
+                    "Name": name,
+                    "Stock": stock_val,
+                    "Virtual_Stock": virtual_stock_val,
+                    "Cost": cost_val,
+                    "Zakup_old": zakup_old,
+                    "Market_Count": 0,
+                    "Market_Prices": None,
+                    "Market_suppliers_used": None,
+                    "Market_Selected": None,
+                    "Chosen_Index": None,
+                    "Zakup_new": zakup_new,
+                    "Delta": delta,
+                    "Change": change,
+                    "Rule": "STOCK_GT0_NO_MARKET_USE_OLD",
+                    "Reason": "STOCK_GT0_PRICE_MUST_EXIST",
+                    "Stock_raw": stock_raw,
+                }
+            )
             continue
 
         # --- анти-выбросы и выбор по рынку ---
@@ -1952,7 +2828,9 @@ def analyze_zakup_df(df: pd.DataFrame) -> pd.DataFrame:
 
         # обычный выбор по рынку, если ещё не выбрали
         if price_chosen is None:
-            price_chosen, base_reason = pick_zakup_from_sorted_prices(market_prices_sorted)
+            price_chosen, base_reason = pick_zakup_from_sorted_prices(
+                market_prices_sorted
+            )
             if reason is None:
                 reason = base_reason
 
@@ -1968,10 +2846,16 @@ def analyze_zakup_df(df: pd.DataFrame) -> pd.DataFrame:
 
         # ==== защита (после выбора рынка) ====
         # Пол: при наличии стока и валидном Cost — не ниже Cost×1.015
-        if (stock_val is not None and stock_val > 0) and (cost_val is not None) and (price_chosen is not None):
+        if (
+            (stock_val is not None and stock_val > 0)
+            and (cost_val is not None)
+            and (price_chosen is not None)
+        ):
             if price_chosen < cost_val:
                 price_chosen = cost_val * 1.015
-                reason = (reason + " | " if reason else "") + "RAISED_TO_COST_PLUS_1_5_STOCK_GT0"
+                reason = (
+                    reason + " | " if reason else ""
+                ) + "RAISED_TO_COST_PLUS_1_5_STOCK_GT0"
 
         # Потолок: не выше Old×1.15 (если old есть)
         if (price_chosen is not None) and (zakup_old is not None):
@@ -1991,19 +2875,50 @@ def analyze_zakup_df(df: pd.DataFrame) -> pd.DataFrame:
         elif zakup_new is not None and zakup_old is None:
             change = "Y"
 
-        results.append({
-            "Code": code, "Name": name, "Stock": stock_val, "Virtual_Stock": virtual_stock_val,
-            "Cost": cost_val, "Zakup_old": zakup_old,
-            "Market_Count": len(market_prices_sorted),
-            "Market_Prices": "; ".join(map(lambda x: str(round_half_down_0_01(x)), market_prices_sorted)) if market_prices_sorted else None,
-            "Market_suppliers_used": "; ".join([f"{n}:{p}" for n, p in market_sorted_pairs]) if market_pairs else None,
-            "Market_Selected": market_selected, "Chosen_Index": chosen_index,
-            "Zakup_new": zakup_new, "Delta": delta, "Change": change,
-            "Rule": rule, "Reason": reason, "Stock_raw": stock_raw,
-        })
+        results.append(
+            {
+                "Code": code,
+                "Name": name,
+                "Stock": stock_val,
+                "Virtual_Stock": virtual_stock_val,
+                "Cost": cost_val,
+                "Zakup_old": zakup_old,
+                "Market_Count": len(market_prices_sorted),
+                "Market_Prices": (
+                    "; ".join(
+                        map(
+                            lambda x: str(round_half_down_0_01(x)), market_prices_sorted
+                        )
+                    )
+                    if market_prices_sorted
+                    else None
+                ),
+                "Market_suppliers_used": (
+                    "; ".join([f"{n}:{p}" for n, p in market_sorted_pairs])
+                    if market_pairs
+                    else None
+                ),
+                "Market_Selected": market_selected,
+                "Chosen_Index": chosen_index,
+                "Zakup_new": zakup_new,
+                "Delta": delta,
+                "Change": change,
+                "Rule": rule,
+                "Reason": reason,
+                "Stock_raw": stock_raw,
+            }
+        )
 
     out = pd.DataFrame(results)
-    for c in ["Stock", "Virtual_Stock", "Cost", "Zakup_old", "Zakup_new", "Delta", "Chosen_Index"]:
+    for c in [
+        "Stock",
+        "Virtual_Stock",
+        "Cost",
+        "Zakup_old",
+        "Zakup_new",
+        "Delta",
+        "Chosen_Index",
+    ]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
 
@@ -2012,34 +2927,47 @@ def analyze_zakup_df(df: pd.DataFrame) -> pd.DataFrame:
         if pd.isna(z) or pd.isna(cost) or cost == 0:
             return None
         return round_half_down_0_01((z - cost) / cost * 100.0)
+
     if "Zakup_new" in out.columns and "Cost" in out.columns:
-        out["Margin_to_Cost_%"] = [_margin_pct(z, c) for z, c in zip(out["Zakup_new"], out["Cost"])]
-        out["Margin_to_Cost_%"] = pd.to_numeric(out["Margin_to_Cost_%"], errors="coerce")
+        out["Margin_to_Cost_%"] = [
+            _margin_pct(z, c) for z, c in zip(out["Zakup_new"], out["Cost"])
+        ]
+        out["Margin_to_Cost_%"] = pd.to_numeric(
+            out["Margin_to_Cost_%"], errors="coerce"
+        )
 
     # Порядок столбцов (под f17-стиль) + Market_Prices в конце по желанию
     preferred = [
-        "Code", "Name",
-        "Stock", "Virtual_Stock",
-        "Cost", "Zakup_old", "Zakup_new", "Delta", "Margin_to_Cost_%",
-        "Market_Selected", "Chosen_Index",
+        "Code",
+        "Name",
+        "Stock",
+        "Virtual_Stock",
+        "Cost",
+        "Zakup_old",
+        "Zakup_new",
+        "Delta",
+        "Margin_to_Cost_%",
+        "Market_Selected",
+        "Chosen_Index",
         "Market_suppliers_used",
-        "Rule", "Reason"
+        "Rule",
+        "Reason",
     ]
     preferred_present = [c for c in preferred if c in out.columns]
     tail = [c for c in out.columns if c not in preferred_present + ["Market_Prices"]]
-    out = out[preferred_present + tail + (["Market_Prices"] if "Market_Prices" in out.columns else [])]
+    out = out[
+        preferred_present
+        + tail
+        + (["Market_Prices"] if "Market_Prices" in out.columns else [])
+    ]
     return out
+
 
 # ======== VIP BLOCK — DO NOT MODIFY ========
 # (ниже — функции и константы, отвечающие только за VIP)
 
 # ===== VIP: референс/рынок (особые правила: Парель/Парк Марк/Шамбор) =====
 # --- VIP-only ---
-PAREL_MARK_PATTERNS_VIP = [
-    r"\bпарел[ьи]\s*ма", r"\bпарел[ьи]\s*марк",
-    r"\bparel+\s*ma",    r"\bparel+\s*mark",
-    r"\bparell+\s*ma",   r"\bparell+\s*mark",
-]
 
 # Базовый список рынка (мягкие матчинги)
 MARKET_SUPPLIERS = [
@@ -2073,6 +3001,7 @@ EXCLUDED_MARKET_PATTERNS = [
     r"(?:^|[\s(\[{])владимир\s*\.\.\.(?:$|[\s)\]}:,-])",
 ]
 
+
 def _vip_norm(s: str) -> str:
     ns = norm(s).replace("—", "-").replace("…", "...")
     ns = re.sub(r"\.{2,}", "...", ns)
@@ -2080,38 +3009,43 @@ def _vip_norm(s: str) -> str:
     ns = re.sub(r"\s+", " ", ns).strip()
     return ns
 
+
 def _vip_word_boundary_contains(haystack: str, needle: str) -> bool:
     pat = r"(?:^|[\s().-:])" + re.escape(needle) + r"(?:$|[\s().-:])"
     return re.search(pat, haystack, flags=re.IGNORECASE) is not None
 
-def _is_parel_mark_vip(ns: str) -> bool:
-    return any(re.search(p, ns, flags=re.IGNORECASE) for p in PAREL_MARK_PATTERNS_VIP)
 
-def _is_bare_parel_vip(ns: str) -> bool:
-    if re.search(r"\bпарел[ьи]\b(?!\s*ма)", ns, flags=re.IGNORECASE): return True
-    if re.search(r"\bparel{1,2}\b(?!\s*ma)", ns, flags=re.IGNORECASE): return True
-    return False
+
 
 def is_ref_supplier_vip(s: str) -> bool:
-    if not isinstance(s, str): return False
+    if not isinstance(s, str):
+        return False
     ns = _vip_norm(s)
-    if _is_bare_parel_vip(ns): return False
-    if "парк марк" in ns or "park mark" in ns: return True
-    if "шамбор" in ns and ("ндс" in ns or "без нд" in ns): return True
-    if _is_parel_mark_vip(ns): return True
+    if _is_bare_parel(ns):
+        return False
+    if "парк марк" in ns or "park mark" in ns:
+        return True
+    if "шамбор" in ns and ("ндс" in ns or "без нд" in ns):
+        return True
+    if _is_parel_mark(ns):
+        return True
     return False
+
 
 def is_market_supplier_vip(s: str) -> bool:
     """
     Рынок для VIP: исключаем «Парк Марк» и любую «Парель», остальное — мягкие правила.
     """
-    if not isinstance(s, str) or not s.strip(): return False
+    if not isinstance(s, str) or not s.strip():
+        return False
     ns = _vip_norm(s)
 
     # исключаем референс «Парк Марк»
-    if "парк марк" in ns or "park mark" in ns: return False
+    if "парк марк" in ns or "park mark" in ns:
+        return False
     # любую Парель исключаем из рынка
-    if _is_bare_parel_vip(ns) or _is_parel_mark_vip(ns): return False
+    if _is_bare_parel(ns) or _is_parel_mark(ns):
+        return False
 
     # явные исключения
     for bad in EXCLUDED_MARKET_SUPPLIERS:
@@ -2122,14 +3056,20 @@ def is_market_supplier_vip(s: str) -> bool:
             return False
 
     # мягкие совпадения рынка
-    if re.search(r"\bлужники\s*и(?:[^a-zа-я]|$)", ns, flags=re.IGNORECASE): return True
-    if re.search(r"\bнастя\s*мар(?:ина|\b|[^a-zа-я])", ns, flags=re.IGNORECASE): return True
-    if re.search(r"(?:^|[\s().:;\-])нат[сc](?:$|[\s().:;\-])", ns, flags=re.IGNORECASE): return True
-    if re.search(r"(?:^|[\s().:;\-])парк(?:$|[\s().:;\-])", ns, flags=re.IGNORECASE): return True
-    if re.search(r"\bальянс\s*гр", ns, flags=re.IGNORECASE): return True
+    if re.search(r"\bлужники\s*и(?:[^a-zа-я]|$)", ns, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\bнастя\s*мар(?:ина|\b|[^a-zа-я])", ns, flags=re.IGNORECASE):
+        return True
+    if re.search(r"(?:^|[\s().:;\-])нат[сc](?:$|[\s().:;\-])", ns, flags=re.IGNORECASE):
+        return True
+    if re.search(r"(?:^|[\s().:;\-])парк(?:$|[\s().:;\-])", ns, flags=re.IGNORECASE):
+        return True
+    if re.search(r"\bальянс\s*гр", ns, flags=re.IGNORECASE):
+        return True
 
     # «Владимир» ровно словом — рынок
-    if re.fullmatch(r"\s*владимир\s*", ns, flags=re.IGNORECASE): return True
+    if re.fullmatch(r"\s*владимир\s*", ns, flags=re.IGNORECASE):
+        return True
 
     # базовый список
     for key in MARKET_SUPPLIERS:
@@ -2138,7 +3078,9 @@ def is_market_supplier_vip(s: str) -> bool:
 
     return False
 
+
 # ========= VIP Analysis =========
+
 
 def _vip_is_cost_header(text: str) -> bool:
     if not isinstance(text, str):
@@ -2146,13 +3088,17 @@ def _vip_is_cost_header(text: str) -> bool:
     t = norm(text).replace(" ", "")
     return t.startswith("cost") or t.startswith("кост") or t.startswith("себест")
 
+
 def _vip_is_vip_header(text: str) -> bool:
     if not isinstance(text, str):
         return False
     t = norm(text).replace(" ", "")
     return t.startswith("vip")
 
-def find_cost_vip_stock_cell(data: List[List], pr: int, y_base: int) -> Tuple[int, int, Optional[Tuple[int,int]]]:
+
+def find_cost_vip_stock_cell(
+    data: List[List], pr: int, y_base: int
+) -> Tuple[int, int, Optional[Tuple[int, int]]]:
     cost_col = vip_col = -1
     headers = data[pr] if pr < len(data) else []
 
@@ -2180,7 +3126,9 @@ def find_cost_vip_stock_cell(data: List[List], pr: int, y_base: int) -> Tuple[in
     return cost_col, vip_col, stock_cell
 
 
-def analyze_vip_df(df: pd.DataFrame, VIP_FALLBACK_COL=_VIP_FALLBACK_COL_FROZEN) -> pd.DataFrame:
+def analyze_vip_df(
+    df: pd.DataFrame, VIP_FALLBACK_COL=_VIP_FALLBACK_COL_FROZEN
+) -> pd.DataFrame:
     data = df.values.tolist()
     y_base = detect_flag_base(data)
     s_base = detect_strike_base(data)
@@ -2197,7 +3145,9 @@ def analyze_vip_df(df: pd.DataFrame, VIP_FALLBACK_COL=_VIP_FALLBACK_COL_FROZEN) 
         raise ValueError("Не найден первый товар в первых 50 строках.")
 
     # найти столбец остатков (по заголовку или по статистике)
-    stock_col = find_col_by_tokens(data, first_row, y_base, {"остаток","остатки","stock"}, fallback_1based=None)
+    stock_col = find_col_by_tokens(
+        data, first_row, y_base, {"остаток", "остатки", "stock"}, fallback_1based=None
+    )
     if stock_col == -1:
         scan_top = min(len(data), first_row + 300)
         best_j, best_cnt = -1, -1
@@ -2221,7 +3171,9 @@ def analyze_vip_df(df: pd.DataFrame, VIP_FALLBACK_COL=_VIP_FALLBACK_COL_FROZEN) 
         if is_intlike(data[r][1] if len(data[r]) > 1 else None):
             product_rows.append(r)
             r += 1
-            while r < len(data) and not is_intlike(data[r][1] if len(data[r]) > 1 else None):
+            while r < len(data) and not is_intlike(
+                data[r][1] if len(data[r]) > 1 else None
+            ):
                 r += 1
         else:
             r += 1
@@ -2232,74 +3184,142 @@ def analyze_vip_df(df: pd.DataFrame, VIP_FALLBACK_COL=_VIP_FALLBACK_COL_FROZEN) 
         name = extract_name_row(data, pr, 4)
         cost_col, vip_col = find_cost_vip_cols(data, pr, y_base)
 
-        # ----- Остаток (robust) -----
+        # ----- Остатки (с приоритетом stock_col) -----
         stock_val = virtual_stock_val = None
         stock_raw = None
 
-        total, virt, raw = read_stock_robust(data, pr, y_base, stock_col)
-        if total is not None:
-            stock_val = total
-            virtual_stock_val = virt
-            stock_raw = raw
+        # 3.1. Пытаемся прочитать ТОЛЬКО из stock_col (pr, pr+1, pr+2)
+        if stock_col is not None and stock_col >= 0:
+            for r_off in (0, 1, 2):
+                rr = pr + r_off
+                if rr >= len(data):
+                    break
+                val = data[rr][stock_col] if len(data[rr]) > stock_col else None
+                if isinstance(val, str) and STOCK_PATTERN.match(val):
+                    vvirt = parse_virtual_stock_value(val)
+                    if _virtual_ok(vvirt):
+                        stock_raw = val
+                        stock_val = parse_stock_value(val)
+                        virtual_stock_val = vvirt
+                        break
 
-        if stock_raw is not None and not _virtual_ok(virtual_stock_val):
-            # это была не колонка остатков → игнорируем
-            stock_raw = None
-            stock_val = None
-            virtual_stock_val = None
+        # 3.2. Если не нашли — ДОПУСКАЕМ широкий поиск, но только с проверкой виртуала
+        if stock_val is None:
+            best = None  # (segments, rr, jj, raw)
+            for r_off in (0, 1, 2):
+                rr = pr + r_off
+                if rr >= len(data):
+                    break
+                for jj in range(0, y_base):
+                    val = data[rr][jj] if len(data[rr]) > jj else None
+                    if isinstance(val, str) and STOCK_PATTERN.match(val):
+                        vvirt = parse_virtual_stock_value(val)
+                        if not _virtual_ok(vvirt):
+                            continue
+                        cand = (val.count("/"), rr, jj, val)
+                        if best is None or cand[0] > best[0]:
+                            best = cand
+            if best is not None:
+                _, rr, jj, raw = best
+                stock_raw = raw
+                stock_val = parse_stock_value(raw)
+                virtual_stock_val = parse_virtual_stock_value(raw)
 
         # COST: только если ячейка жёлтая; позже можем снять при Stock=0
-        raw_cost = parse_float(data[pr + 1][cost_col]) if pr + 1 < len(data) and cost_col != -1 else None
-        raw_cost = None if (raw_cost is None or raw_cost <= 0) else float(raw_cost)
-        cost_yellow = flag_at(data, pr + 1, cost_col, y_base) if cost_col != -1 else False
-        cost_exists = (raw_cost is not None) and cost_yellow
-        cost_used = raw_cost if cost_exists else None
+        raw_cost = None
+        cost_val = None
+        cost_src = "NOT_FOUND_YELLOW"
+        cost_row_idx = None
+
+        if (
+            cost_col is not None
+            and cost_col >= 0
+            and pr + 1 < len(data)
+            and len(data[pr + 1]) > cost_col
+        ):
+            tmp = parse_float(data[pr + 1][cost_col])
+            raw_cost = float(tmp) if (tmp is not None and tmp > 0) else None
+            is_y = flag_at(data, pr + 1, cost_col, y_base)  # жёлтая обязательна
+            # В VIP strike НЕ проверяем
+            if raw_cost is not None and is_y:
+                cost_val = raw_cost
+                cost_src = "YELLOW"
+                cost_row_idx = pr + 1
+
+        cost_exists = (cost_val is not None)
+        cost_used = cost_val
         forced_no_cost = False
         cost_original = raw_cost
         cost_changed = False
 
         # Глобальные стопы
         if virtual_stock_val == 35:
-            results.append({
-                "Code": code, "B": "", "Name": name,
-                "Stock": stock_val, "Virtual_Stock": virtual_stock_val,
-                "Cost": None, "Cost_Yellow": "N",
-                "Old_VIP": None, "New_VIP": None, "Delta": None, "Change": "N",
-                "Rule": "VIRTUAL_STOCK_35_SKIP",
-                "X_ref": None, "X_ref_supplier": None, "Reason": "VIRTUAL_STOCK_35_SKIP",
-                "Market_suppliers_used": None, "Market_suppliers_all": None,
-                "Market_suppliers_all_count": 0, "Stock_raw": stock_raw,
-                "Cost_Forced_NoCost": "N", "Cost_Original": cost_original, "Cost_Changed": "N",
-            })
+            results.append(
+                {
+                    "Code": code,
+                    "B": "",
+                    "Name": name,
+                    "Stock": stock_val,
+                    "Virtual_Stock": virtual_stock_val,
+                    "Cost": None,
+                    "Cost_Yellow": "N",
+                    "Old_VIP": None,
+                    "New_VIP": None,
+                    "Delta": None,
+                    "Change": "N",
+                    "Rule": "VIRTUAL_STOCK_35_SKIP",
+                    "X_ref": None,
+                    "X_ref_supplier": None,
+                    "Reason": "VIRTUAL_STOCK_35_SKIP",
+                    "Market_suppliers_used": None,
+                    "Market_suppliers_all": None,
+                    "Market_suppliers_all_count": 0,
+                    "Stock_raw": stock_raw,
+                    "Cost_Forced_NoCost": "N",
+                    "Cost_Original": cost_original,
+                    "Cost_Changed": "N",
+                }
+            )
             continue
 
-        if (stock_val is not None and stock_val <= 0) and (virtual_stock_val is not None and virtual_stock_val == 0):
-            results.append({
-                "Code": code, "B": "", "Name": name,
-                "Stock": stock_val, "Virtual_Stock": virtual_stock_val,
-                "Cost": None, "Cost_Yellow": "N",
-                "Old_VIP": None, "New_VIP": None, "Delta": None, "Change": "N",
-                "Rule": "STOCK_0_AND_VIRT_0_SKIP",
-                "X_ref": None, "X_ref_supplier": None, "Reason": "STOCK_0_AND_VIRTUAL_0_SKIP",
-                "Market_suppliers_all": None, "Market_suppliers_all_count": 0, "Stock_raw": stock_raw,
-                "Cost_Forced_NoCost": "N", "Cost_Original": cost_original, "Cost_Changed": "N",
-            })
+        if (stock_val is not None and stock_val <= 0) and (
+            virtual_stock_val is not None and virtual_stock_val == 0
+        ):
+            results.append(
+                {
+                    "Code": code,
+                    "B": "",
+                    "Name": name,
+                    "Stock": stock_val,
+                    "Virtual_Stock": virtual_stock_val,
+                    "Cost": None,
+                    "Cost_Yellow": "N",
+                    "Old_VIP": None,
+                    "New_VIP": None,
+                    "Delta": None,
+                    "Change": "N",
+                    "Rule": "STOCK_0_AND_VIRT_0_SKIP",
+                    "X_ref": None,
+                    "X_ref_supplier": None,
+                    "Reason": "STOCK_0_AND_VIRTUAL_0_SKIP",
+                    "Market_suppliers_all": None,
+                    "Market_suppliers_all_count": 0,
+                    "Stock_raw": stock_raw,
+                    "Cost_Forced_NoCost": "N",
+                    "Cost_Original": cost_original,
+                    "Cost_Changed": "N",
+                }
+            )
             continue
 
         colB_note = "старая цена (нет цены)" if not cost_exists else ""
 
-        # Если реального стока нет — снимаем Cost
-        no_real_stock = (stock_val is not None and stock_val <= 0)
-        if no_real_stock and cost_exists:
-            forced_no_cost = True
-            cost_changed = True
-            cost_exists = False
-            cost_used = None
-            cost_yellow = False
-            colB_note = (colB_note + " | COST снят из-за Stock=0").strip(" |")
-
         # OLD VIP: только если жёлтый и не зачёркнут
-        oldVIP_raw = parse_float(data[pr + 1][vip_col]) if pr + 1 < len(data) and vip_col != -1 else None
+        oldVIP_raw = (
+            parse_float(data[pr + 1][vip_col])
+            if pr + 1 < len(data) and vip_col != -1
+            else None
+        )
         vip_yellow = flag_at(data, pr + 1, vip_col, y_base) if vip_col != -1 else False
         vip_strike = flag_at(data, pr + 1, vip_col, s_base) if vip_col != -1 else False
         oldVIP_exists = (oldVIP_raw is not None) and vip_yellow and (not vip_strike)
@@ -2309,7 +3329,9 @@ def analyze_vip_df(df: pd.DataFrame, VIP_FALLBACK_COL=_VIP_FALLBACK_COL_FROZEN) 
         ref_prices = []
         market_prices = []
         rr = pr + 2
-        while rr < len(data) and not is_intlike(data[rr][1] if len(data[rr]) > 1 else None):
+        while rr < len(data) and not is_intlike(
+            data[rr][1] if len(data[rr]) > 1 else None
+        ):
             if rr + 1 >= len(data):
                 break
             for j in range(0, y_base):
@@ -2331,7 +3353,11 @@ def analyze_vip_df(df: pd.DataFrame, VIP_FALLBACK_COL=_VIP_FALLBACK_COL_FROZEN) 
             rr += 1
 
         market_all_sorted = sorted(market_prices, key=lambda t: t[1])
-        market_all_str = "; ".join([f"{n}:{p}" for n, p in market_all_sorted]) if market_all_sorted else None
+        market_all_str = (
+            "; ".join([f"{n}:{p}" for n, p in market_all_sorted])
+            if market_all_sorted
+            else None
+        )
         market_all_cnt = len(market_all_sorted)
 
         # === ЛОГИКА ===
@@ -2343,13 +3369,25 @@ def analyze_vip_df(df: pd.DataFrame, VIP_FALLBACK_COL=_VIP_FALLBACK_COL_FROZEN) 
                     newVIP = oldVIP_used
                     reason = "NO_REF_PRICE_KEEP_OLD"
                 else:
-                    guard_candidate = ceil1(cost_used * 1.01) if cost_used is not None else None
-                    newVIP = floor1(guard_candidate) if guard_candidate is not None else None
-                    reason = "NO_REF_PRICE_GUARD_1pct" if newVIP is not None else "NO_REF_PRICE_NO_COST"
+                    guard_candidate = (
+                        ceil1(cost_used * 1.01) if cost_used is not None else None
+                    )
+                    newVIP = (
+                        floor1(guard_candidate) if guard_candidate is not None else None
+                    )
+                    reason = (
+                        "NO_REF_PRICE_GUARD_1pct"
+                        if newVIP is not None
+                        else "NO_REF_PRICE_NO_COST"
+                    )
             else:
                 pmin = min([p for _, p in ref_prices])
                 xref_suppliers = [n for (n, p) in ref_prices if p == pmin]
-                xref_supplier = "; ".join(sorted(set(map(str, xref_suppliers)))) if xref_suppliers else None
+                xref_supplier = (
+                    "; ".join(sorted(set(map(str, xref_suppliers))))
+                    if xref_suppliers
+                    else None
+                )
 
                 ref_raw = pmin / 1.2
                 ref = round_half_down_0_01(ref_raw)
@@ -2364,53 +3402,88 @@ def analyze_vip_df(df: pd.DataFrame, VIP_FALLBACK_COL=_VIP_FALLBACK_COL_FROZEN) 
                     newVIP = floor1(float(newVIP))
                 reason = None
 
-            delta = None if (newVIP is None or oldVIP_used is None) else round(newVIP - oldVIP_used, 2)
+            delta = (
+                None
+                if (newVIP is None or oldVIP_used is None)
+                else round(newVIP - oldVIP_used, 2)
+            )
             change = "Y" if (delta is not None and abs(delta) >= 0.01) else "N"
-            results.append({
-                "Code": code, "B": colB_note, "Name": name,
-                "Stock": stock_val, "Virtual_Stock": virtual_stock_val,
-                "Cost": cost_used, "Cost_Yellow": "Y" if cost_yellow else "N",
-                "Old_VIP": oldVIP_used, "New_VIP": newVIP, "Delta": delta, "Change": change,
-                "Rule": "STANDARD_COST_PRESENT",
-                "X_ref": ref if 'ref' in locals() else None,
-                "X_ref_supplier": xref_supplier if 'xref_supplier' in locals() else None,
-                "Reason": reason,
-                "Market_suppliers_used": None, "Market_suppliers_all": market_all_str,
-                "Market_suppliers_all_count": market_all_cnt,
-                "Stock_raw": stock_raw, "Cost_Forced_NoCost": "Y" if forced_no_cost else "N",
-                "Cost_Original": cost_original, "Cost_Changed": "Y" if cost_changed else "N",
-            })
+            results.append(
+                {
+                    "Code": code,
+                    "B": colB_note,
+                    "Name": name,
+                    "Stock": stock_val,
+                    "Virtual_Stock": virtual_stock_val,
+                    "Cost": cost_used,
+                    "Cost_Yellow": "Y" if is_y else "N",
+                    "Old_VIP": oldVIP_used,
+                    "New_VIP": newVIP,
+                    "Delta": delta,
+                    "Change": change,
+                    "Rule": "STANDARD_COST_PRESENT",
+                    "X_ref": ref if "ref" in locals() else None,
+                    "X_ref_supplier": (
+                        xref_supplier if "xref_supplier" in locals() else None
+                    ),
+                    "Reason": reason,
+                    "Market_suppliers_used": None,
+                    "Market_suppliers_all": market_all_str,
+                    "Market_suppliers_all_count": market_all_cnt,
+                    "Stock_raw": stock_raw,
+                    "Cost_Forced_NoCost": "Y" if forced_no_cost else "N",
+                    "Cost_Original": cost_original,
+                    "Cost_Changed": "Y" if cost_changed else "N",
+                }
+            )
             continue
 
         # ---- НЕТ COST ----
 
         # 1) Есть реальный сток и Old_VIP — держим старый
         if (stock_val is not None and stock_val > 0) and (oldVIP_used is not None):
-            results.append({
-                "Code": code, "B": colB_note, "Name": name,
-                "Stock": stock_val, "Virtual_Stock": virtual_stock_val,
-                "Cost": None, "Cost_Yellow": "N",
-                "Old_VIP": oldVIP_used, "New_VIP": oldVIP_used, "Delta": 0.0, "Change": "N",
-                "Rule": "NO_COST_STOCK_POS_KEEP_OLD",
-                "X_ref": None, "X_ref_supplier": None, "Reason": "NO_COST_STOCK_GT0_KEEP_OLDVIP",
-                "Market_suppliers_used": None, "Market_suppliers_all": market_all_str,
-                "Market_suppliers_all_count": market_all_cnt,
-                "Stock_raw": stock_raw,
-                "Cost_Forced_NoCost": "Y" if forced_no_cost else "N",
-                "Cost_Original": cost_original, "Cost_Changed": "Y" if cost_changed else "N",
-            })
+            results.append(
+                {
+                    "Code": code,
+                    "B": colB_note,
+                    "Name": name,
+                    "Stock": stock_val,
+                    "Virtual_Stock": virtual_stock_val,
+                    "Cost": None,
+                    "Cost_Yellow": "N",
+                    "Old_VIP": oldVIP_used,
+                    "New_VIP": oldVIP_used,
+                    "Delta": 0.0,
+                    "Change": "N",
+                    "Rule": "NO_COST_STOCK_POS_KEEP_OLD",
+                    "X_ref": None,
+                    "X_ref_supplier": None,
+                    "Reason": "NO_COST_STOCK_GT0_KEEP_OLDVIP",
+                    "Market_suppliers_used": None,
+                    "Market_suppliers_all": market_all_str,
+                    "Market_suppliers_all_count": market_all_cnt,
+                    "Stock_raw": stock_raw,
+                    "Cost_Forced_NoCost": "Y" if forced_no_cost else "N",
+                    "Cost_Original": cost_original,
+                    "Cost_Changed": "Y" if cost_changed else "N",
+                }
+            )
             continue
 
         # 2) Считаем X_ref и рынок
         pmin_ref = min([p for _, p in ref_prices]) if ref_prices else None
         if ref_prices and pmin_ref is not None:
             xref_suppliers = [n for (n, p) in ref_prices if p == pmin_ref]
-            xref_supplier = "; ".join(sorted(set(map(str, xref_suppliers)))) if xref_suppliers else None
+            xref_supplier = (
+                "; ".join(sorted(set(map(str, xref_suppliers))))
+                if xref_suppliers
+                else None
+            )
         else:
             xref_supplier = None
 
-        ref_raw  = (pmin_ref / 1.2) if pmin_ref is not None else None
-        ref      = round_half_down_0_01(ref_raw) if ref_raw is not None else None
+        ref_raw = (pmin_ref / 1.2) if pmin_ref is not None else None
+        ref = round_half_down_0_01(ref_raw) if ref_raw is not None else None
 
         market_list = market_all_sorted
         newVIP = None
@@ -2424,9 +3497,15 @@ def analyze_vip_df(df: pd.DataFrame, VIP_FALLBACK_COL=_VIP_FALLBACK_COL_FROZEN) 
             if len(market_lower) >= 1:
                 newVIP = floor1(float(ref))
                 reason = "PASS_PMIN_USE_XREF"
-                market_used = "; ".join([f"{n}:{p}" for n, p in sorted(market_lower, key=lambda t: t[1])])
+                market_used = "; ".join(
+                    [f"{n}:{p}" for n, p in sorted(market_lower, key=lambda t: t[1])]
+                )
             else:
-                if (stock_val is not None and stock_val > 0) and (oldVIP_used is None) and len(market_list) >= 1:
+                if (
+                    (stock_val is not None and stock_val > 0)
+                    and (oldVIP_used is None)
+                    and len(market_list) >= 1
+                ):
                     n_min, p_min = market_list[0]
                     newVIP = floor1(float(p_min) * 1.01)
                     reason = "NO_PMIN_PASS_USE_MIN_MARKET_PLUS1pct"
@@ -2455,29 +3534,63 @@ def analyze_vip_df(df: pd.DataFrame, VIP_FALLBACK_COL=_VIP_FALLBACK_COL_FROZEN) 
                 reason = "NO_REF_PRICE_OR_NO_MARKET"
                 market_used = None
 
-        delta = None if (newVIP is None or oldVIP_used is None) else round(newVIP - oldVIP_used, 2)
-        results.append({
-            "Code": code, "B": colB_note, "Name": name,
-            "Stock": stock_val, "Virtual_Stock": virtual_stock_val,
-            "Cost": None, "Cost_Yellow": "N",
-            "Old_VIP": oldVIP_used, "New_VIP": newVIP, "Delta": delta,
-            "Change": "Y" if (delta is not None and abs(delta) >= 0.01) else "N" if newVIP is not None else "N",
-            "Rule": "NO_COST_MARKET_REF_RULE",
-            "X_ref": ref, "X_ref_supplier": xref_supplier, "Reason": reason,
-            "Market_suppliers_used": market_used, "Market_suppliers_all": market_all_str,
-            "Market_suppliers_all_count": market_all_cnt,
-            "Stock_raw": stock_raw, "Cost_Forced_NoCost": "Y" if forced_no_cost else "N",
-            "Cost_Original": cost_original, "Cost_Changed": "Y" if cost_changed else "N",
-        })
+        delta = (
+            None
+            if (newVIP is None or oldVIP_used is None)
+            else round(newVIP - oldVIP_used, 2)
+        )
+        results.append(
+            {
+                "Code": code,
+                "B": colB_note,
+                "Name": name,
+                "Stock": stock_val,
+                "Virtual_Stock": virtual_stock_val,
+                "Cost": None,
+                "Cost_Yellow": "N",
+                "Old_VIP": oldVIP_used,
+                "New_VIP": newVIP,
+                "Delta": delta,
+                "Change": (
+                    "Y"
+                    if (delta is not None and abs(delta) >= 0.01)
+                    else "N" if newVIP is not None else "N"
+                ),
+                "Rule": "NO_COST_MARKET_REF_RULE",
+                "X_ref": ref,
+                "X_ref_supplier": xref_supplier,
+                "Reason": reason,
+                "Market_suppliers_used": market_used,
+                "Market_suppliers_all": market_all_str,
+                "Market_suppliers_all_count": market_all_cnt,
+                "Stock_raw": stock_raw,
+                "Cost_Forced_NoCost": "Y" if forced_no_cost else "N",
+                "Cost_Original": cost_original,
+                "Cost_Changed": "Y" if cost_changed else "N",
+            }
+        )
 
     out = pd.DataFrame(results)
 
     # Приведение типов
-    for c in ["Cost","Old_VIP","New_VIP","Delta","X_ref","Stock","Virtual_Stock","Cost_Original"]:
+    for c in [
+        "Cost",
+        "Old_VIP",
+        "New_VIP",
+        "Delta",
+        "X_ref",
+        "Stock",
+        "Virtual_Stock",
+        "Cost_Original",
+    ]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce")
     if "Market_suppliers_all_count" in out.columns:
-        out["Market_suppliers_all_count"] = pd.to_numeric(out["Market_suppliers_all_count"], errors="coerce").fillna(0).astype(int)
+        out["Market_suppliers_all_count"] = (
+            pd.to_numeric(out["Market_suppliers_all_count"], errors="coerce")
+            .fillna(0)
+            .astype(int)
+        )
 
     # Вставить X_ref_supplier сразу после X_ref
     cols = list(out.columns)
@@ -2495,45 +3608,70 @@ def analyze_vip_df(df: pd.DataFrame, VIP_FALLBACK_COL=_VIP_FALLBACK_COL_FROZEN) 
         if pd.isna(new_vip) or pd.isna(cost) or cost == 0:
             return None
         return round_half_down_0_01((new_vip - cost) / cost * 100.0)
+
     if "New_VIP" in out.columns and "Cost" in out.columns:
-        out["Margin_to_Cost_%"] = [ _margin_pct(n, c) for n, c in zip(out["New_VIP"], out["Cost"]) ]
-        out["Margin_to_Cost_%"] = pd.to_numeric(out["Margin_to_Cost_%"], errors="coerce")
+        out["Margin_to_Cost_%"] = [
+            _margin_pct(n, c) for n, c in zip(out["New_VIP"], out["Cost"])
+        ]
+        out["Margin_to_Cost_%"] = pd.to_numeric(
+            out["Margin_to_Cost_%"], errors="coerce"
+        )
 
     # Порядок колонок
     preferred = [
-        "Code", "Name",
-        "Stock", "Virtual_Stock",
-        "Cost", "Old_VIP", "New_VIP", "Delta", "Margin_to_Cost_%",
-        "X_ref", "X_ref_supplier",
-        "Market_suppliers_all_count", "Market_suppliers_all", "Market_suppliers_used",
-        "Rule", "Reason", "B"
+        "Code",
+        "Name",
+        "Stock",
+        "Virtual_Stock",
+        "Cost",
+        "Old_VIP",
+        "New_VIP",
+        "Delta",
+        "Margin_to_Cost_%",
+        "X_ref",
+        "X_ref_supplier",
+        "Market_suppliers_all_count",
+        "Market_suppliers_all",
+        "Market_suppliers_used",
+        "Rule",
+        "Reason",
+        "B",
     ]
     preferred_present = [c for c in preferred if c in out.columns]
     tail = [c for c in out.columns if c not in preferred_present]
     out = out[preferred_present + tail]
     return out
 
+
 # ========= Excel Export Functions =========
 
-def export_cash_to_excel(cash_df: pd.DataFrame) -> BytesIO:
-    """Экспорт Cash анализа в Excel с условным форматированием"""
+
+def create_excel_export_base(df: pd.DataFrame, sheet_name: str) -> Tuple[BytesIO, object, object]:
+    """
+    Базовая функция для создания Excel экспорта.
+    Возвращает (output, workbook, worksheet)
+    """
     output = BytesIO()
     
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        cash_df.to_excel(writer, sheet_name='Cash_Analysis', index=False)
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name=sheet_name, index=False)
         
         # Получаем workbook и worksheet
         workbook = writer.book
-        worksheet = writer.sheets['Cash_Analysis']
+        worksheet = writer.sheets[sheet_name]
         
         # Замораживаем первую строку
-        worksheet.freeze_panes = 'A2'
+        worksheet.freeze_panes = "A2"
         
-        # Условное форматирование
-        try:
-            cols_map = {name: i + 1 for i, name in enumerate(cash_df.columns)}
-            last_row = cash_df.shape[0] + 1
-            
+        return output, workbook, worksheet
+
+
+def apply_conditional_formatting(worksheet, cols_map: dict, last_row: int, analysis_type: str):
+    """
+    Применяет условное форматирование в зависимости от типа анализа
+    """
+    try:
+        if analysis_type == "cash":
             # Градиент для Delta_Cost_to_CashNew_%
             if "Delta_Cost_to_CashNew_%" in cols_map:
                 col_letter = get_column_letter(cols_map["Delta_Cost_to_CashNew_%"])
@@ -2541,10 +3679,14 @@ def export_cash_to_excel(cash_df: pd.DataFrame) -> BytesIO:
                 worksheet.conditional_formatting.add(
                     rng,
                     ColorScaleRule(
-                        start_type='min', start_color='FFF8696B',
-                        mid_type='percentile', mid_value=50, mid_color='FFFFEB84',
-                        end_type='max', end_color='FF63BE7B'
-                    )
+                        start_type="min",
+                        start_color="FFF8696B",
+                        mid_type="percentile",
+                        mid_value=50,
+                        mid_color="FFFFEB84",
+                        end_type="max",
+                        end_color="FF63BE7B",
+                    ),
                 )
             
             # Градиент для Delta
@@ -2554,65 +3696,19 @@ def export_cash_to_excel(cash_df: pd.DataFrame) -> BytesIO:
                 worksheet.conditional_formatting.add(
                     drng,
                     ColorScaleRule(
-                        start_type='num', start_value=-1, start_color='FFF4CCCC',
-                        mid_type='num', mid_value=0, mid_color='FFD9D9D9',
-                        end_type='num', end_value=1, end_color='FF93C47D'
-                    )
+                        start_type="num",
+                        start_value=-1,
+                        start_color="FFF4CCCC",
+                        mid_type="num",
+                        mid_value=0,
+                        mid_color="FFD9D9D9",
+                        end_type="num",
+                        end_value=1,
+                        end_color="FFC6EFCE",
+                    ),
                 )
-            
-            # Cash_new: синий если изменилась цена
-            if "Cash_new" in cols_map and "Cash_old" in cols_map:
-                cash_new_col = get_column_letter(cols_map["Cash_new"])
-                cash_old_col = get_column_letter(cols_map["Cash_old"])
-                cash_new_range = f"{cash_new_col}2:{cash_new_col}{last_row}"
-                
-                worksheet.conditional_formatting.add(
-                    cash_new_range,
-                    FormulaRule(
-                        formula=[f"AND({cash_new_col}2<>{cash_old_col}2,{cash_new_col}2<>\"\")"],
-                        fill=PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
-                    )
-                )
-            
-            # Пустые значения: светло-серый
-            empty_cols = ["Cost", "Cash_old", "Cash_new"]
-            for col_name in empty_cols:
-                if col_name in cols_map:
-                    col_idx = cols_map[col_name]
-                    col_range = f"{get_column_letter(col_idx)}2:{get_column_letter(col_idx)}{last_row}"
-                    
-                    worksheet.conditional_formatting.add(
-                        col_range,
-                        CellIsRule(
-                            operator="equal", formula=["\"\""],
-                            fill=PatternFill(start_color="F5F5F5", end_color="F5F5F5", fill_type="solid")
-                        )
-                    )
-        except Exception as e:
-            st.warning(f"Ошибка условного форматирования: {e}")
-    
-    output.seek(0)
-    return output
-
-def export_f17_to_excel(f17_df: pd.DataFrame) -> BytesIO:
-    """Экспорт F17 анализа в Excel с условным форматированием"""
-    output = BytesIO()
-    
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        f17_df.to_excel(writer, sheet_name='F17_Analysis', index=False)
         
-        # Получаем workbook и worksheet
-        workbook = writer.book
-        worksheet = writer.sheets['F17_Analysis']
-        
-        # Замораживаем первую строку
-        worksheet.freeze_panes = 'A2'
-        
-        # Условное форматирование
-        try:
-            cols_map = {name: i + 1 for i, name in enumerate(f17_df.columns)}
-            last_row = f17_df.shape[0] + 1
-            
+        elif analysis_type == "f17":
             # Градиент для Delta_F17
             if "Delta_F17" in cols_map:
                 delta_col = get_column_letter(cols_map["Delta_F17"])
@@ -2621,10 +3717,16 @@ def export_f17_to_excel(f17_df: pd.DataFrame) -> BytesIO:
                 worksheet.conditional_formatting.add(
                     delta_range,
                     ColorScaleRule(
-                        start_type="num", start_value=-1, start_color="FF6B6B",
-                        mid_type="num", mid_value=0, mid_color="D3D3D3",
-                        end_type="num", end_value=1, end_color="90EE90"
-                    )
+                        start_type="num",
+                        start_value=-1,
+                        start_color="FF6B6B",
+                        mid_type="num",
+                        mid_value=0,
+                        mid_color="D3D3D3",
+                        end_type="num",
+                        end_value=1,
+                        end_color="90EE90",
+                    ),
                 )
             
             # F17_new: синий если изменилась цена
@@ -2636,189 +3738,170 @@ def export_f17_to_excel(f17_df: pd.DataFrame) -> BytesIO:
                 worksheet.conditional_formatting.add(
                     f17_new_range,
                     FormulaRule(
-                        formula=[f"AND({f17_new_col}2<>{f17_old_col}2,{f17_new_col}2<>\"\")"],
-                        fill=PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
-                    )
+                        formula=[
+                            f'AND({f17_new_col}2<>{f17_old_col}2,{f17_new_col}2<>"")'
+                        ],
+                        fill=PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid"),
+                    ),
                 )
-            
-            # Margin_to_Cost_% — 3-цветная шкала (красный→жёлтый→зелёный)
-            if "Margin_to_Cost_%" in cols_map:
-                margin_col = get_column_letter(cols_map["Margin_to_Cost_%"])
-                margin_range = f"{margin_col}2:{margin_col}{last_row}"
+        
+        elif analysis_type == "zakup":
+            # Градиент для Delta_Zakup
+            if "Delta_Zakup" in cols_map:
+                delta_col = get_column_letter(cols_map["Delta_Zakup"])
+                delta_range = f"{delta_col}2:{delta_col}{last_row}"
                 
                 worksheet.conditional_formatting.add(
-                    margin_range,
+                    delta_range,
                     ColorScaleRule(
-                        start_type='min', start_color='FFF8696B',
-                        mid_type='percentile', mid_value=50, mid_color='FFFFEB84',
-                        end_type='max', end_color='FF63BE7B'
-                    )
+                        start_type="num",
+                        start_value=-1,
+                        start_color="FF6B6B",
+                        mid_type="num",
+                        mid_value=0,
+                        mid_color="D3D3D3",
+                        end_type="num",
+                        end_value=1,
+                        end_color="90EE90",
+                    ),
                 )
-            
-            # Пустые значения: светло-серый
-            empty_cols = ["Cost", "Cash", "F17_old", "F17_new"]
-            for col_name in empty_cols:
-                if col_name in cols_map:
-                    col_idx = cols_map[col_name]
-                    col_range = f"{get_column_letter(col_idx)}2:{get_column_letter(col_idx)}{last_row}"
-                    
-                    worksheet.conditional_formatting.add(
-                        col_range,
-                        CellIsRule(
-                            operator="equal", formula=["\"\""],
-                            fill=PatternFill(start_color="F5F5F5", end_color="F5F5F5", fill_type="solid")
-                        )
-                    )
-        except Exception as e:
-            st.warning(f"Ошибка условного форматирования: {e}")
+        
+        elif analysis_type == "vip":
+            # Градиент для Delta_VIP
+            if "Delta_VIP" in cols_map:
+                delta_col = get_column_letter(cols_map["Delta_VIP"])
+                delta_range = f"{delta_col}2:{delta_col}{last_row}"
+                
+                worksheet.conditional_formatting.add(
+                    delta_range,
+                    ColorScaleRule(
+                        start_type="num",
+                        start_value=-1,
+                        start_color="FF6B6B",
+                        mid_type="num",
+                        mid_value=0,
+                        mid_color="D3D3D3",
+                        end_type="num",
+                        end_value=1,
+                        end_color="90EE90",
+                    ),
+                )
     
-    output.seek(0)
+    except Exception as e:
+        print(f"Ошибка условного форматирования: {e}")
+
+
+def export_cash_to_excel(cash_df: pd.DataFrame) -> BytesIO:
+    """Экспорт Cash анализа в Excel с условным форматированием"""
+    output, workbook, worksheet = create_excel_export_base(cash_df, "Cash_Analysis")
+    
+    # Условное форматирование
+    cols_map = {name: i + 1 for i, name in enumerate(cash_df.columns)}
+    last_row = cash_df.shape[0] + 1
+    apply_conditional_formatting(worksheet, cols_map, last_row, "cash")
+    
+    return output
+
+
+
+
+def export_f17_to_excel(f17_df: pd.DataFrame) -> BytesIO:
+    """Экспорт F17 анализа в Excel с условным форматированием"""
+    output, workbook, worksheet = create_excel_export_base(f17_df, "F17_Analysis")
+    
+    # Условное форматирование
+    cols_map = {name: i + 1 for i, name in enumerate(f17_df.columns)}
+    last_row = f17_df.shape[0] + 1
+    apply_conditional_formatting(worksheet, cols_map, last_row, "f17")
+    
     return output
 
 def export_zakup_to_excel(zakup_df: pd.DataFrame) -> BytesIO:
     """Экспорт Zakup анализа в Excel с условным форматированием"""
-    output = BytesIO()
+    output, workbook, worksheet = create_excel_export_base(zakup_df, "Zakup_Analysis")
     
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        zakup_df.to_excel(writer, sheet_name='Zakup_Analysis', index=False)
-        
-        # Получаем workbook и worksheet
-        workbook = writer.book
-        worksheet = writer.sheets['Zakup_Analysis']
-        
-        # Замораживаем первую строку
-        worksheet.freeze_panes = 'A2'
-        
-        # Условное форматирование
-        try:
-            cols_map = {name: i + 1 for i, name in enumerate(zakup_df.columns)}
-            last_row = zakup_df.shape[0] + 1
-            
-            # Градиент для Delta
-            if "Delta" in cols_map:
-                delta_col = get_column_letter(cols_map["Delta"])
-                delta_range = f"{delta_col}2:{delta_col}{last_row}"
-                
-                worksheet.conditional_formatting.add(
-                    delta_range,
-                    ColorScaleRule(
-                        start_type="num", start_value=-1, start_color="FF6B6B",
-                        mid_type="num", mid_value=0, mid_color="D3D3D3",
-                        end_type="num", end_value=1, end_color="90EE90"
-                    )
-                )
-            
-            # Zakup_new: синий если изменилась цена
-            if "Zakup_new" in cols_map and "Zakup_old" in cols_map:
-                zakup_new_col = get_column_letter(cols_map["Zakup_new"])
-                zakup_old_col = get_column_letter(cols_map["Zakup_old"])
-                zakup_new_range = f"{zakup_new_col}2:{zakup_new_col}{last_row}"
-                
-                worksheet.conditional_formatting.add(
-                    zakup_new_range,
-                    FormulaRule(
-                        formula=[f"AND({zakup_new_col}2<>{zakup_old_col}2,{zakup_new_col}2<>\"\")"],
-                        fill=PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
-                    )
-                )
-            
-            # Margin_to_Cost_% — 3-цветная шкала (красный→жёлтый→зелёный)
-            if "Margin_to_Cost_%" in cols_map:
-                margin_col = get_column_letter(cols_map["Margin_to_Cost_%"])
-                margin_range = f"{margin_col}2:{margin_col}{last_row}"
-                
-                worksheet.conditional_formatting.add(
-                    margin_range,
-                    ColorScaleRule(
-                        start_type='min', start_color='FFF8696B',
-                        mid_type='percentile', mid_value=50, mid_color='FFFFEB84',
-                        end_type='max', end_color='FF63BE7B'
-                    )
-                )
-            
-            # Пустые значения: светло-серый
-            empty_cols = ["Cost", "Zakup_old", "Zakup_new"]
-            for col_name in empty_cols:
-                if col_name in cols_map:
-                    col_idx = cols_map[col_name]
-                    col_range = f"{get_column_letter(col_idx)}2:{get_column_letter(col_idx)}{last_row}"
-                    
-                    worksheet.conditional_formatting.add(
-                        col_range,
-                        CellIsRule(
-                            operator="equal", formula=["\"\""],
-                            fill=PatternFill(start_color="F5F5F5", end_color="F5F5F5", fill_type="solid")
-                        )
-                    )
-        except Exception as e:
-            st.warning(f"Ошибка условного форматирования: {e}")
+    # Условное форматирование
+    cols_map = {name: i + 1 for i, name in enumerate(zakup_df.columns)}
+    last_row = zakup_df.shape[0] + 1
+    apply_conditional_formatting(worksheet, cols_map, last_row, "zakup")
     
-    output.seek(0)
     return output
-
-# ======== END VIP BLOCK ========
 
 def export_vip_to_excel(vip_df: pd.DataFrame) -> BytesIO:
     """Экспорт VIP анализа в Excel с условным форматированием"""
     output = BytesIO()
-    
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        vip_df.to_excel(writer, sheet_name='VIP_Analysis', index=False)
-        
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        vip_df.to_excel(writer, sheet_name="VIP_Analysis", index=False)
+
         # Получаем workbook и worksheet
         workbook = writer.book
-        worksheet = writer.sheets['VIP_Analysis']
-        
+        worksheet = writer.sheets["VIP_Analysis"]
+
         # Замораживаем первую строку
-        worksheet.freeze_panes = 'A2'
-        
+        worksheet.freeze_panes = "A2"
+
         # Условное форматирование
         try:
             cols_map = {name: i + 1 for i, name in enumerate(vip_df.columns)}
             last_row = vip_df.shape[0] + 1
-            
+
             # Градиент для Delta
             if "Delta" in cols_map:
                 delta_col = get_column_letter(cols_map["Delta"])
                 delta_range = f"{delta_col}2:{delta_col}{last_row}"
-                
+
                 worksheet.conditional_formatting.add(
                     delta_range,
                     ColorScaleRule(
-                        start_type="num", start_value=-1, start_color="FF6B6B",
-                        mid_type="num", mid_value=0, mid_color="D3D3D3",
-                        end_type="num", end_value=1, end_color="90EE90"
-                    )
+                        start_type="num",
+                        start_value=-1,
+                        start_color="FF6B6B",
+                        mid_type="num",
+                        mid_value=0,
+                        mid_color="D3D3D3",
+                        end_type="num",
+                        end_value=1,
+                        end_color="90EE90",
+                    ),
                 )
-            
+
             # New_VIP: синий если изменилась цена
             if "New_VIP" in cols_map and "Old_VIP" in cols_map:
                 new_vip_col = get_column_letter(cols_map["New_VIP"])
                 old_vip_col = get_column_letter(cols_map["Old_VIP"])
                 new_vip_range = f"{new_vip_col}2:{new_vip_col}{last_row}"
-                
+
                 worksheet.conditional_formatting.add(
                     new_vip_range,
                     FormulaRule(
-                        formula=[f"AND({new_vip_col}2<>{old_vip_col}2,{new_vip_col}2<>\"\")"],
-                        fill=PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
-                    )
+                        formula=[
+                            f'AND({new_vip_col}2<>{old_vip_col}2,{new_vip_col}2<>"")'
+                        ],
+                        fill=PatternFill(
+                            start_color="ADD8E6", end_color="ADD8E6", fill_type="solid"
+                        ),
+                    ),
                 )
-            
+
             # Margin_to_Cost_% — 3-цветная шкала (красный→жёлтый→зелёный)
             if "Margin_to_Cost_%" in cols_map:
                 margin_col = get_column_letter(cols_map["Margin_to_Cost_%"])
                 margin_range = f"{margin_col}2:{margin_col}{last_row}"
-                
+
                 worksheet.conditional_formatting.add(
                     margin_range,
                     ColorScaleRule(
-                        start_type='min', start_color='FFF8696B',
-                        mid_type='percentile', mid_value=50, mid_color='FFFFEB84',
-                        end_type='max', end_color='FF63BE7B'
-                    )
+                        start_type="min",
+                        start_color="FFF8696B",
+                        mid_type="percentile",
+                        mid_value=50,
+                        mid_color="FFFFEB84",
+                        end_type="max",
+                        end_color="FF63BE7B",
+                    ),
                 )
-            
+
             # Пустые значения: светло-серый
             empty_cols = ["Cost", "Old_VIP", "New_VIP"]
             fill_gray = PatternFill(fill_type="solid", fgColor="FFD9D9D9")
@@ -2826,214 +3909,278 @@ def export_vip_to_excel(vip_df: pd.DataFrame) -> BytesIO:
                 if col_name in cols_map:
                     col_letter = get_column_letter(cols_map[col_name])
                     col_range = f"{col_letter}2:{col_letter}{last_row}"
-                    
+
                     worksheet.conditional_formatting.add(
                         col_range,
                         FormulaRule(
-                            formula=[f'OR(ISBLANK({col_letter}2),LEN(TRIM({col_letter}2))=0,{col_letter}2="")'],
+                            formula=[
+                                f'OR(ISBLANK({col_letter}2),LEN(TRIM({col_letter}2))=0,{col_letter}2="")'
+                            ],
                             fill=fill_gray,
-                            stopIfTrue=False
-                        )
+                            stopIfTrue=False,
+                        ),
                     )
-            
+
             # Выделить всю строку красным, если есть остаток (Stock>0), но New_VIP пустой
             if "Stock" in cols_map and "New_VIP" in cols_map:
                 stock_letter = get_column_letter(cols_map["Stock"])
                 newvip_letter = get_column_letter(cols_map["New_VIP"])
                 last_col_letter = get_column_letter(len(vip_df.columns))
-                
+
                 # Формула для выделения строки
                 formula = f'AND(${stock_letter}2>0, LEN(TRIM(${newvip_letter}2&""))=0)'
                 row_range = f"A2:{last_col_letter}{last_row}"
-                
+
                 worksheet.conditional_formatting.add(
                     row_range,
                     FormulaRule(
                         formula=[formula],
-                        fill=PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
-                    )
+                        fill=PatternFill(
+                            start_color="FF6B6B", end_color="FF6B6B", fill_type="solid"
+                        ),
+                    ),
                 )
         except Exception as e:
             st.warning(f"Ошибка условного форматирования: {e}")
-    
+
     output.seek(0)
     return output
 
-def export_all_analyses_to_excel(cash_df: pd.DataFrame, f17_df: pd.DataFrame, 
-                                zakup_df: pd.DataFrame, vip_df: pd.DataFrame) -> BytesIO:
+
+def export_all_analyses_to_excel(
+    cash_df: pd.DataFrame,
+    f17_df: pd.DataFrame,
+    zakup_df: pd.DataFrame,
+    vip_df: pd.DataFrame,
+) -> BytesIO:
     """Экспорт всех анализов в один Excel файл с 4 листами"""
     output = BytesIO()
-    
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
         # Записываем все анализы на отдельные листы
-        cash_df.to_excel(writer, sheet_name='Cash_Analysis', index=False)
-        f17_df.to_excel(writer, sheet_name='F17_Analysis', index=False)
-        zakup_df.to_excel(writer, sheet_name='Zakup_Analysis', index=False)
-        vip_df.to_excel(writer, sheet_name='VIP_Analysis', index=False)
-        
+        cash_df.to_excel(writer, sheet_name="Cash_Analysis", index=False)
+        f17_df.to_excel(writer, sheet_name="F17_Analysis", index=False)
+        zakup_df.to_excel(writer, sheet_name="Zakup_Analysis", index=False)
+        vip_df.to_excel(writer, sheet_name="VIP_Analysis", index=False)
+
         # Получаем workbook
         workbook = writer.book
-        
+
         # Применяем форматирование к каждому листу
-        for sheet_name, df in [('Cash_Analysis', cash_df), ('F17_Analysis', f17_df), 
-                              ('Zakup_Analysis', zakup_df), ('VIP_Analysis', vip_df)]:
+        for sheet_name, df in [
+            ("Cash_Analysis", cash_df),
+            ("F17_Analysis", f17_df),
+            ("Zakup_Analysis", zakup_df),
+            ("VIP_Analysis", vip_df),
+        ]:
             worksheet = workbook[sheet_name]
-            worksheet.freeze_panes = 'A2'
-            
+            worksheet.freeze_panes = "A2"
+
             # Применяем соответствующее условное форматирование
             try:
                 cols_map = {name: i + 1 for i, name in enumerate(df.columns)}
                 last_row = df.shape[0] + 1
-                
+
                 # Общее форматирование для всех листов
                 # раньше было: if "Delta" in cols_map: ...
-                delta_key = "Delta" if "Delta" in cols_map else ("Delta_F17" if "Delta_F17" in cols_map else None)
+                delta_key = (
+                    "Delta"
+                    if "Delta" in cols_map
+                    else ("Delta_F17" if "Delta_F17" in cols_map else None)
+                )
                 if delta_key:
                     delta_col = get_column_letter(cols_map[delta_key])
                     delta_range = f"{delta_col}2:{delta_col}{last_row}"
                     worksheet.conditional_formatting.add(
                         delta_range,
                         ColorScaleRule(
-                            start_type="num", start_value=-1, start_color="FF6B6B",
-                            mid_type="num", mid_value=0, mid_color="D3D3D3",
-                            end_type="num", end_value=1, end_color="90EE90"
-                        )
+                            start_type="num",
+                            start_value=-1,
+                            start_color="FF6B6B",
+                            mid_type="num",
+                            mid_value=0,
+                            mid_color="D3D3D3",
+                            end_type="num",
+                            end_value=1,
+                            end_color="90EE90",
+                        ),
                     )
-                
+
                 # Margin_to_Cost_% — 3-цветная шкала (красный→жёлтый→зелёный)
                 if "Margin_to_Cost_%" in cols_map:
                     margin_col = get_column_letter(cols_map["Margin_to_Cost_%"])
                     margin_range = f"{margin_col}2:{margin_col}{last_row}"
-                    
+
                     worksheet.conditional_formatting.add(
                         margin_range,
                         ColorScaleRule(
-                            start_type='min', start_color='FFF8696B',
-                            mid_type='percentile', mid_value=50, mid_color='FFFFEB84',
-                            end_type='max', end_color='FF63BE7B'
-                        )
+                            start_type="min",
+                            start_color="FFF8696B",
+                            mid_type="percentile",
+                            mid_value=50,
+                            mid_color="FFFFEB84",
+                            end_type="max",
+                            end_color="FF63BE7B",
+                        ),
                     )
-                
+
                 # Специфичное форматирование для каждого типа анализа
-                if sheet_name == 'Cash_Analysis':
+                if sheet_name == "Cash_Analysis":
                     # Градиент для Delta_Cost_to_CashNew_%
                     if "Delta_Cost_to_CashNew_%" in cols_map:
-                        col_letter = get_column_letter(cols_map["Delta_Cost_to_CashNew_%"])
+                        col_letter = get_column_letter(
+                            cols_map["Delta_Cost_to_CashNew_%"]
+                        )
                         rng = f"{col_letter}2:{col_letter}{last_row}"
                         worksheet.conditional_formatting.add(
                             rng,
                             ColorScaleRule(
-                                start_type='min', start_color='FFF8696B',
-                                mid_type='percentile', mid_value=50, mid_color='FFFFEB84',
-                                end_type='max', end_color='FF63BE7B'
-                            )
+                                start_type="min",
+                                start_color="FFF8696B",
+                                mid_type="percentile",
+                                mid_value=50,
+                                mid_color="FFFFEB84",
+                                end_type="max",
+                                end_color="FF63BE7B",
+                            ),
                         )
-                    
+
                     # Cash_new: синий если изменилась цена
                     if "Cash_new" in cols_map and "Cash_old" in cols_map:
                         cash_new_col = get_column_letter(cols_map["Cash_new"])
                         cash_old_col = get_column_letter(cols_map["Cash_old"])
                         cash_new_range = f"{cash_new_col}2:{cash_new_col}{last_row}"
-                        
+
                         worksheet.conditional_formatting.add(
                             cash_new_range,
                             FormulaRule(
-                                formula=[f"AND({cash_new_col}2<>{cash_old_col}2,{cash_new_col}2<>\"\")"],
-                                fill=PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
-                            )
+                                formula=[
+                                    f'AND({cash_new_col}2<>{cash_old_col}2,{cash_new_col}2<>"")'
+                                ],
+                                fill=PatternFill(
+                                    start_color="ADD8E6",
+                                    end_color="ADD8E6",
+                                    fill_type="solid",
+                                ),
+                            ),
                         )
-                    
+
                     empty_cols = ["Cost", "Cash_old", "Cash_new"]
-                
-                elif sheet_name == 'F17_Analysis':
+
+                elif sheet_name == "F17_Analysis":
                     # F17_new: синий если изменилась цена
                     if "F17_new" in cols_map and "F17_old" in cols_map:
                         f17_new_col = get_column_letter(cols_map["F17_new"])
                         f17_old_col = get_column_letter(cols_map["F17_old"])
                         f17_new_range = f"{f17_new_col}2:{f17_new_col}{last_row}"
-                        
+
                         worksheet.conditional_formatting.add(
                             f17_new_range,
                             FormulaRule(
-                                formula=[f"AND({f17_new_col}2<>{f17_old_col}2,{f17_new_col}2<>\"\")"],
-                                fill=PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
-                            )
+                                formula=[
+                                    f'AND({f17_new_col}2<>{f17_old_col}2,{f17_new_col}2<>"")'
+                                ],
+                                fill=PatternFill(
+                                    start_color="ADD8E6",
+                                    end_color="ADD8E6",
+                                    fill_type="solid",
+                                ),
+                            ),
                         )
-                    
+
                     empty_cols = ["Cost", "Cash", "F17_old", "F17_new"]
-                
-                elif sheet_name == 'Zakup_Analysis':
+
+                elif sheet_name == "Zakup_Analysis":
                     # Zakup_new: синий если изменилась цена
                     if "Zakup_new" in cols_map and "Zakup_old" in cols_map:
                         zakup_new_col = get_column_letter(cols_map["Zakup_new"])
                         zakup_old_col = get_column_letter(cols_map["Zakup_old"])
                         zakup_new_range = f"{zakup_new_col}2:{zakup_new_col}{last_row}"
-                        
+
                         worksheet.conditional_formatting.add(
                             zakup_new_range,
                             FormulaRule(
-                                formula=[f"AND({zakup_new_col}2<>{zakup_old_col}2,{zakup_new_col}2<>\"\")"],
-                                fill=PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
-                            )
+                                formula=[
+                                    f'AND({zakup_new_col}2<>{zakup_old_col}2,{zakup_new_col}2<>"")'
+                                ],
+                                fill=PatternFill(
+                                    start_color="ADD8E6",
+                                    end_color="ADD8E6",
+                                    fill_type="solid",
+                                ),
+                            ),
                         )
-                    
+
                     empty_cols = ["Cost", "Zakup_old", "Zakup_new"]
-                
-                elif sheet_name == 'VIP_Analysis':
+
+                elif sheet_name == "VIP_Analysis":
                     # New_VIP: синий если изменилась цена
                     if "New_VIP" in cols_map and "Old_VIP" in cols_map:
                         new_vip_col = get_column_letter(cols_map["New_VIP"])
                         old_vip_col = get_column_letter(cols_map["Old_VIP"])
                         new_vip_range = f"{new_vip_col}2:{new_vip_col}{last_row}"
-                        
+
                         worksheet.conditional_formatting.add(
                             new_vip_range,
                             FormulaRule(
-                                formula=[f"AND({new_vip_col}2<>{old_vip_col}2,{new_vip_col}2<>\"\")"],
-                                fill=PatternFill(start_color="ADD8E6", end_color="ADD8E6", fill_type="solid")
-                            )
+                                formula=[
+                                    f'AND({new_vip_col}2<>{old_vip_col}2,{new_vip_col}2<>"")'
+                                ],
+                                fill=PatternFill(
+                                    start_color="ADD8E6",
+                                    end_color="ADD8E6",
+                                    fill_type="solid",
+                                ),
+                            ),
                         )
-                    
+
                     empty_cols = ["Cost", "Old_VIP", "New_VIP"]
                     fill_gray = PatternFill(fill_type="solid", fgColor="FFD9D9D9")
-                    
+
                     # Пустые значения: светло-серый (только для VIP)
                     for col_name in empty_cols:
                         if col_name in cols_map:
                             col_letter = get_column_letter(cols_map[col_name])
                             col_range = f"{col_letter}2:{col_letter}{last_row}"
-                            
+
                             worksheet.conditional_formatting.add(
                                 col_range,
                                 FormulaRule(
-                                    formula=[f'OR(ISBLANK({col_letter}2),LEN(TRIM({col_letter}2))=0,{col_letter}2="")'],
+                                    formula=[
+                                        f'OR(ISBLANK({col_letter}2),LEN(TRIM({col_letter}2))=0,{col_letter}2="")'
+                                    ],
                                     fill=fill_gray,
-                                    stopIfTrue=False
-                                )
+                                    stopIfTrue=False,
+                                ),
                             )
-                    
+
                     # Выделить всю строку красным, если есть остаток (Stock>0), но New_VIP пустой
                     if "Stock" in cols_map and "New_VIP" in cols_map:
                         stock_letter = get_column_letter(cols_map["Stock"])
                         newvip_letter = get_column_letter(cols_map["New_VIP"])
                         last_col_letter = get_column_letter(len(df.columns))
-                        
+
                         formula = f'AND(${stock_letter}2>0, LEN(TRIM(${newvip_letter}2&""))=0)'
                         row_range = f"A2:{last_col_letter}{last_row}"
-                        
+
                         worksheet.conditional_formatting.add(
                             row_range,
                             FormulaRule(
                                 formula=[formula],
-                                fill=PatternFill(start_color="FF6B6B", end_color="FF6B6B", fill_type="solid")
-                            )
+                                fill=PatternFill(
+                                    start_color="FF6B6B",
+                                    end_color="FF6B6B",
+                                    fill_type="solid",
+                                ),
+                            ),
                         )
-                        
+
             except Exception as e:
                 st.warning(f"Ошибка условного форматирования для {sheet_name}: {e}")
-    
+
     output.seek(0)
     return output
+
 
 # ========= UI =========
 st.title("Загрузить анализ рынка для актуальзации цен: Cash, F17, Zakup, VIP")
@@ -3055,49 +4202,49 @@ if st.button("Запустить все анализы"):
             # Показываем прогресс
             progress_bar = st.progress(0)
             status_text = st.empty()
-            
+
             # Загружаем данные с флагами
             status_text.text("Загрузка данных с флагами...")
             df_with_flags = add_yellow_flags_to_df(upl_file)
             progress_bar.progress(10)
-            
+
             progress_bar.progress(20)
-            
+
             # Запускаем все анализы
             status_text.text("Запуск Cash анализа...")
             cash_df = analyze_cash_df(df_with_flags)
             progress_bar.progress(40)
-            
+
             status_text.text("Запуск F17 анализа...")
             f17_df = analyze_f17_df(df_with_flags)
             progress_bar.progress(60)
-            
+
             status_text.text("Запуск Zakup анализа...")
             zakup_df = analyze_zakup_df(df_with_flags)
             progress_bar.progress(80)
-            
+
             status_text.text("Запуск VIP анализа...")
             vip_df = analyze_vip_df(df_with_flags)
             progress_bar.progress(90)
-            
+
             # Показываем результаты
             status_text.text("Отображение результатов...")
-            
+
             # Создаем табы для отображения результатов
             tab1, tab2, tab3, tab4 = st.tabs(["Cash", "F17", "Zakup", "VIP"])
-            
+
             with tab1:
                 st.dataframe(cash_df, height=400)
                 st.write(f"**Cash анализ**: {len(cash_df)} позиций")
-            
+
             with tab2:
                 st.dataframe(f17_df, height=400)
                 st.write(f"**F17 анализ**: {len(f17_df)} позиций")
-            
+
             with tab3:
                 st.dataframe(zakup_df, height=400)
                 st.write(f"**Zakup анализ**: {len(zakup_df)} позиций")
-            
+
             with tab4:
                 st.write("**VIP-анализ Excel: жёсткие правила**")
                 st.write(
@@ -3108,22 +4255,36 @@ if st.button("Запустить все анализы"):
                     "- При Virtual_Stock=35 расчёт VIP не делаем. При Stock=0 и Virtual=0 — тоже пропуск.\n"
                     "- Market_suppliers_all/count — все рыночные поставщики по позиции.\n"
                 )
-                
+
                 highlight_mode = st.selectbox(
                     "Подсветка New_VIP:",
                     ["По флагу Change == 'Y'", "По неравенству New_VIP != Old_VIP"],
                     index=0,
-                    key="newvip_highlight_mode"
+                    key="newvip_highlight_mode",
                 )
-                
+
                 total = len(vip_df)
-                changed = int((vip_df["Change"] == "Y").sum()) if "Change" in vip_df.columns else 0
-                no_new = int(vip_df["New_VIP"].isna().sum()) if "New_VIP" in vip_df.columns else 0
-                forced = int((vip_df["Cost_Forced_NoCost"] == "Y").sum()) if "Cost_Forced_NoCost" in vip_df.columns else 0
-                st.caption(f"Найдено товаров: {total} | Изменений: {changed} | Без нового VIP: {no_new} | Cost снят принудительно: {forced}")
-                
+                changed = (
+                    int((vip_df["Change"] == "Y").sum())
+                    if "Change" in vip_df.columns
+                    else 0
+                )
+                no_new = (
+                    int(vip_df["New_VIP"].isna().sum())
+                    if "New_VIP" in vip_df.columns
+                    else 0
+                )
+                forced = (
+                    int((vip_df["Cost_Forced_NoCost"] == "Y").sum())
+                    if "Cost_Forced_NoCost" in vip_df.columns
+                    else 0
+                )
+                st.caption(
+                    f"Найдено товаров: {total} | Изменений: {changed} | Без нового VIP: {no_new} | Cost снят принудительно: {forced}"
+                )
+
                 st.dataframe(vip_df, height=620)
-                
+
                 # ===== VIP Excel =====
                 vip_output = BytesIO()
                 with pd.ExcelWriter(vip_output, engine="openpyxl") as writer:
@@ -3133,40 +4294,54 @@ if st.button("Запустить все анализы"):
 
                     # автоширина
                     from openpyxl.utils import get_column_letter
+
                     for cidx, col in enumerate(vip_df.columns, start=1):
                         series = vip_df[col].astype(str)
-                        max_len = max([len(col)] + [len(s) for s in series]) if len(series) else len(col)
-                        ws.column_dimensions[get_column_letter(cidx)].width = min(max_len + 2, 60)
+                        max_len = (
+                            max([len(col)] + [len(s) for s in series])
+                            if len(series)
+                            else len(col)
+                        )
+                        ws.column_dimensions[get_column_letter(cidx)].width = min(
+                            max_len + 2, 60
+                        )
 
                     # заливки
+                    from openpyxl.formatting.rule import ColorScaleRule, FormulaRule
                     from openpyxl.styles import PatternFill
-                    from openpyxl.formatting.rule import FormulaRule, ColorScaleRule
-                    fill_gray  = PatternFill(fill_type="solid", fgColor="FFD9D9D9")
-                    fill_blue  = PatternFill(fill_type="solid", fgColor="FFCFE2F3")
+
+                    fill_gray = PatternFill(fill_type="solid", fgColor="FFD9D9D9")
+                    fill_blue = PatternFill(fill_type="solid", fgColor="FFCFE2F3")
                     cols_map = {name: i + 1 for i, name in enumerate(vip_df.columns)}
                     last_row = vip_df.shape[0] + 1
 
                     def rng(col):
-                        if col not in cols_map: return None, None
+                        if col not in cols_map:
+                            return None, None
                         L = get_column_letter(cols_map[col])
                         return f"{L}2:{L}{last_row}", L
 
                     # пустые Cost/Old_VIP/New_VIP → серым
-                    for cname in ["Cost","Old_VIP","New_VIP"]:
+                    for cname in ["Cost", "Old_VIP", "New_VIP"]:
                         arng, L = rng(cname)
                         if arng:
                             ws.conditional_formatting.add(
                                 arng,
                                 FormulaRule(
-                                    formula=[f'OR(ISBLANK({L}2),LEN(TRIM({L}2))=0,{L}2="")'],
+                                    formula=[
+                                        f'OR(ISBLANK({L}2),LEN(TRIM({L}2))=0,{L}2="")'
+                                    ],
                                     fill=fill_gray,
-                                    stopIfTrue=False
-                                )
+                                    stopIfTrue=False,
+                                ),
                             )
                             # явная подстраховка
                             for r in range(2, last_row + 1):
                                 cell = ws[f"{L}{r}"]
-                                if cell.value is None or (isinstance(cell.value, str) and str(cell.value).strip()==""):
+                                if cell.value is None or (
+                                    isinstance(cell.value, str)
+                                    and str(cell.value).strip() == ""
+                                ):
                                     cell.fill = fill_gray
 
                     # Delta: -1 → 0 → 1
@@ -3175,10 +4350,16 @@ if st.button("Запустить все анализы"):
                         ws.conditional_formatting.add(
                             drng,
                             ColorScaleRule(
-                                start_type='num', start_value=-1, start_color='FFF4CCCC',
-                                mid_type='num', mid_value=0,  mid_color='FFD9D9D9',
-                                end_type='num', end_value=1,  end_color='FF93C47D'
-                            )
+                                start_type="num",
+                                start_value=-1,
+                                start_color="FFF4CCCC",
+                                mid_type="num",
+                                mid_value=0,
+                                mid_color="FFD9D9D9",
+                                end_type="num",
+                                end_value=1,
+                                end_color="FF93C47D",
+                            ),
                         )
 
                     # Margin_to_Cost_%: красн→жёлт→зел
@@ -3187,44 +4368,63 @@ if st.button("Запустить все анализы"):
                         ws.conditional_formatting.add(
                             mrng,
                             ColorScaleRule(
-                                start_type='min', start_color='FFF8696B',
-                                mid_type='percentile', mid_value=50, mid_color='FFFFEB84',
-                                end_type='max', end_color='FF63BE7B'
-                            )
+                                start_type="min",
+                                start_color="FFF8696B",
+                                mid_type="percentile",
+                                mid_value=50,
+                                mid_color="FFFFEB84",
+                                end_type="max",
+                                end_color="FF63BE7B",
+                            ),
                         )
 
                     # Красим строку красным, если Stock>0, а New_VIP пустой
                     if "Stock" in cols_map and "New_VIP" in cols_map:
                         stockL = get_column_letter(cols_map["Stock"])
-                        newL   = get_column_letter(cols_map["New_VIP"])
-                        lastL  = get_column_letter(len(vip_df.columns))
+                        newL = get_column_letter(cols_map["New_VIP"])
+                        lastL = get_column_letter(len(vip_df.columns))
                         row_range = f"A2:{lastL}{last_row}"
                         ws.conditional_formatting.add(
                             row_range,
                             FormulaRule(
-                                formula=[f'AND(${stockL}2>0, LEN(TRIM(${newL}2&""))=0)'],
+                                formula=[
+                                    f'AND(${stockL}2>0, LEN(TRIM(${newL}2&""))=0)'
+                                ],
                                 fill=PatternFill(fill_type="solid", fgColor="FFF4CCCC"),
-                                stopIfTrue=False
-                            )
+                                stopIfTrue=False,
+                            ),
                         )
 
                     # Подсветка New_VIP (режимы)
                     nvrng, newL = rng("New_VIP")
                     if nvrng:
-                        if highlight_mode == "По флагу Change == 'Y'" and "Change" in cols_map:
+                        if (
+                            highlight_mode == "По флагу Change == 'Y'"
+                            and "Change" in cols_map
+                        ):
                             chL = get_column_letter(cols_map["Change"])
                             ws.conditional_formatting.add(
                                 nvrng,
-                                FormulaRule(formula=[f'${chL}2="Y"'], fill=fill_blue, stopIfTrue=False)
+                                FormulaRule(
+                                    formula=[f'${chL}2="Y"'],
+                                    fill=fill_blue,
+                                    stopIfTrue=False,
+                                ),
                             )
-                        elif highlight_mode == "По неравенству New_VIP != Old_VIP" and "Old_VIP" in cols_map:
+                        elif (
+                            highlight_mode == "По неравенству New_VIP != Old_VIP"
+                            and "Old_VIP" in cols_map
+                        ):
                             oldL = get_column_letter(cols_map["Old_VIP"])
                             ws.conditional_formatting.add(
                                 nvrng,
                                 FormulaRule(
-                                    formula=[f'AND(LEN(TRIM(${oldL}2))>0,LEN(TRIM(${newL}2))>0,${newL}2<>${oldL}2)'],
-                                    fill=fill_blue, stopIfTrue=False
-                                )
+                                    formula=[
+                                        f"AND(LEN(TRIM(${oldL}2))>0,LEN(TRIM(${newL}2))>0,${newL}2<>${oldL}2)"
+                                    ],
+                                    fill=fill_blue,
+                                    stopIfTrue=False,
+                                ),
                             )
 
                 vip_output.seek(0)
@@ -3234,12 +4434,14 @@ if st.button("Запустить все анализы"):
                     file_name="vip_analysis.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
-            
+
             # Создаем объединенный Excel файл
             status_text.text("Создание Excel файла...")
-            excel_output = export_all_analyses_to_excel(cash_df, f17_df, zakup_df, vip_df)
+            excel_output = export_all_analyses_to_excel(
+                cash_df, f17_df, zakup_df, vip_df
+            )
             progress_bar.progress(100)
-            
+
             # Кнопка скачивания объединенного Excel
             st.download_button(
                 label="📊 Скачать объединенный Excel (все анализы)",
@@ -3247,16 +4449,20 @@ if st.button("Запустить все анализы"):
                 file_name="unified_price_analysis.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-            
+
             status_text.text("✅ Все анализы завершены!")
-            st.success("🎉 Все анализы завершены! Excel файл с 4 листами готов к скачиванию.")
-            
+            st.success(
+                "🎉 Все анализы завершены! Excel файл с 4 листами готов к скачиванию."
+            )
+
         except Exception as e:
             st.error(f"Ошибка: {e}")
             import traceback
+
             st.error(f"Детали ошибки: {traceback.format_exc()}")
     else:
         st.warning("Пожалуйста, загрузите основной файл с рынком.")
+
 
 # ========= SELFCHECK PRICES =========
 def _selfcheck_prices():
@@ -3264,20 +4470,23 @@ def _selfcheck_prices():
     # 1) Cash таргетит p2 и уважает cost+1.5%
     result, reason, rank = cash_choose_price_p2([100, 120, 130], 110, None)
     assert result >= 111.5, f"Cash должен соблюдать маржу 1.5%, got {result}"
-    
+
     result, reason, rank = cash_choose_price_p2([100, 120, 130], None, 140)
-    assert result == 140, f"Cash должен использовать cash_old при отсутствии cost, got {result}"
-    
+    assert (
+        result == 140
+    ), f"Cash должен использовать cash_old при отсутствии cost, got {result}"
+
     # 2) trim_by_gap должен отбрасывать выбросы
     prices = [100.0, 120.0, 200.0]  # 200 - выброс (gap > 40%)
     cleaned, reason = trim_by_gap(prices)
     assert len(cleaned) == 2, f"trim_by_gap должен отбросить выброс, got {cleaned}"
     assert reason == "DROP_MAX_BY_GAP40", f"Неправильная причина: {reason}"
-    
+
     # 3) VIP: базовые проверки (пока простые, можно расширить)
     # VIP функции используют замороженные константы через параметры
-    
+
     print("✅ SELFCHECK PRICES PASSED")
+
 
 # Запускаем чек при импорте (под флагом DEV)
 DEV_MODE = True  # можно выключить в продакшене
